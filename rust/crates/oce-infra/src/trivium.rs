@@ -86,6 +86,32 @@ impl TriviumStore {
         self.r().node_count()
     }
 
+    /// 向量库占用统计（storage 报表）：[(kind, rows), ...]。
+    /// kind 维度与 Milvus 的 chunk/path 双 collection 对应；TQL COUNT 走属性索引。
+    /// 只读旁路：任何失败都降级为空列表，不让报表抛错。
+    pub fn kind_stats(&self) -> Vec<(String, usize)> {
+        let db = self.r();
+        let mut out = Vec::new();
+        for kind in [KIND_CHUNK, KIND_PATH] {
+            let tql = format!(
+                "FIND {{kind: \"{kind}\"}} RETURN count(*) AS rows"
+            );
+            let Ok(rows) = db.tql(&tql) else {
+                continue;
+            };
+            let count = rows
+                .first()
+                .and_then(|row| row.get("rows"))
+                .and_then(|v| match v {
+                    triviumdb::query::tql_executor::TqlValue::Int(n) => Some(*n as usize),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            out.push((kind.to_string(), count));
+        }
+        out
+    }
+
     /// 引擎实际维度（来自文件元数据，非配置值）。
     pub fn dim(&self) -> usize {
         self.r().dim()

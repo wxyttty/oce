@@ -24,6 +24,8 @@ model2vec-rs = "0.2.1"
 rayon = { workspace = true }
 hf-hub = { workspace = true }
 safetensors = { workspace = true }
+sysinfo = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 safetensors = { workspace = true }

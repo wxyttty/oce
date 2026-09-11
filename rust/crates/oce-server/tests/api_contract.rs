@@ -299,7 +299,37 @@ async fn admin_endpoints_auth_and_crud() {
     assert_eq!(body["dry_run"], true);
 
     // stats
-    let (status, body) = call(router, "GET", "/admin/stats?window_hours=24", Some(admin_key), None).await;
+    let (status, body) = call(router.clone(), "GET", "/admin/stats?window_hours=24", Some(admin_key), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["window_hours"], 24);
+
+    // 报表：8 个端点的 200 形状 + 入参收敛（窗口/分桶/明细上限）
+    for (path, shape_key) in [
+        ("/admin/reports/api-calls", "buckets"),
+        ("/admin/reports/retrieval", "buckets"),
+        ("/admin/reports/tokens", "buckets"),
+        ("/admin/reports/index-inventory", "blob_total"),
+        ("/admin/reports/resources", "buckets"),
+        ("/admin/reports/storage", "tables"),
+    ] {
+        let (status, body) = call(router.clone(), "GET", path, Some(admin_key), None).await;
+        assert_eq!(status, StatusCode::OK, "path={path} body={body}");
+        assert!(body.get(shape_key).is_some(), "path={path} missing {shape_key}");
+    }
+    // 明细端点
+    for path in [
+        "/admin/reports/retrieval/slow-queries?limit=5",
+        "/admin/reports/retrieval/empty-queries",
+    ] {
+        let (status, body) = call(router.clone(), "GET", path, Some(admin_key), None).await;
+        assert_eq!(status, StatusCode::OK, "path={path}");
+        assert!(body.get("items").is_some(), "path={path} missing items");
+    }
+    // 非法 bucket → 422
+    let (status, _) = call(router.clone(), "GET", "/admin/reports/api-calls?bucket=week", Some(admin_key), None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // 报表需 admin key（错误 key → 401；ADMIN_API_KEY 空时回落 API_KEY，
+    // 所以正确 API_KEY 也能过——与 Python 版语义一致）
+    let (status, _) = call(router, "GET", "/admin/reports/api-calls", Some("wrong-key"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

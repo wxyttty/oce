@@ -5,12 +5,18 @@ use crate::schemas::*;
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use oce_app::service::{BlobUpload, RetrievalApplication};
 use oce_core::error::OceError;
+use oce_core::metrics::MetricsSink;
+use oce_infra::sqlite::reports::{
+    ApiCallsReport, IndexInventoryReport, ResourcesReport, RetrievalReport, StorageReport,
+    TokensReport,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -116,13 +122,56 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/queue/requeue-stale", post(admin_requeue_stale))
         .route("/admin/gc", post(admin_gc))
         .route("/admin/stats", get(admin_stats))
+        // 报表（只读旁路）
+        .route("/admin/reports/api-calls", get(report_api_calls))
+        .route("/admin/reports/retrieval", get(report_retrieval))
+        .route("/admin/reports/retrieval/slow-queries", get(report_slow_queries))
+        .route("/admin/reports/retrieval/empty-queries", get(report_empty_queries))
+        .route("/admin/reports/tokens", get(report_tokens))
+        .route("/admin/reports/index-inventory", get(report_index_inventory))
+        .route("/admin/reports/resources", get(report_resources))
+        .route("/admin/reports/storage", get(report_storage))
         // Meta
         .route("/health", get(health))
         .route("/version", get(version))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_call_metrics_middleware,
+        ))
         .with_state(state)
         // FastAPI/uvicorn 对 JSON body 无默认上限；ace-client 单批内容 ≤2MB，
         // JSON 转义（\n→\\n 等）与协议包裹会放大体积，取 64MB 留足余量
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+}
+
+/// HTTP 调用监控中间件（对应 Python ApiCallMetricsMiddleware）。
+/// 旁路：采集失败只跳过；monitoring 关闭（sink 未装配）时直接放行；/health 豁免。
+async fn api_call_metrics_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    const EXEMPT: [&str; 1] = ["/health"];
+    let path = req.uri().path().to_string();
+    if EXEMPT.contains(&path.as_str()) {
+        return next.run(req).await;
+    }
+    let method = req.method().to_string();
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    if let Some(metrics) = &state.container.metrics {
+        metrics.record_api_call(oce_core::metrics::ApiCallRecord {
+            // 路由模板不可得时退化为请求路径（axum 0.8 无 route 模板暴露；
+            // 个人模式端点少，路径即模板，无动态段）
+            endpoint: path.chars().take(128).collect(),
+            method,
+            status_code: status,
+            latency_ms: started.elapsed().as_millis() as u64,
+            error_type: if status >= 500 { Some("http_error".into()) } else { None },
+        });
+    }
+    response
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -487,6 +536,15 @@ async fn admin_stats(
     } else {
         0.0
     };
+    let resource = stats.resource.map(|r| ResourceSnapshotResponse {
+        ts: Some(r.ts),
+        mem_rss_bytes: r.mem_rss_bytes,
+        mem_percent: r.mem_percent,
+        cpu_percent: r.cpu_percent,
+        disk_free_bytes: r.disk_free_bytes,
+        disk_total_bytes: r.disk_total_bytes,
+        disk_data_bytes: r.disk_data_bytes,
+    });
     Ok(Json(MonitoringStatsResponse {
         window_hours,
         api_calls: ApiCallStatsResponse {
@@ -512,8 +570,211 @@ async fn admin_stats(
             empty_count: stats.retrieval.empty_count,
             empty_rate,
         },
-        resource: None,
+        resource,
     }))
+}
+
+// ───────────────────────────────────────────────────────── 报表端点
+// 入参在路由层收敛（与 Python 版一致）：窗口 1..720h、明细 1..500 行、分桶仅 hour/day。
+
+fn clamp_window(window_hours: u32) -> u32 {
+    window_hours.clamp(1, 720)
+}
+
+fn clamp_limit(limit: u32) -> u32 {
+    limit.clamp(1, 500)
+}
+
+fn validate_bucket(bucket: &str) -> Result<String, Response> {
+    if bucket != "hour" && bucket != "day" {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"detail": "bucket must be 'hour' or 'day'"})),
+        )
+            .into_response());
+    }
+    Ok(bucket.to_string())
+}
+
+/// 报表参数提取：window_hours（默认 24）、bucket（默认 hour）。
+fn report_params(params: &std::collections::HashMap<String, String>) -> (u32, String) {
+    let window_hours = params
+        .get("window_hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let bucket = params.get("bucket").cloned().unwrap_or_else(|| "hour".into());
+    (window_hours, bucket)
+}
+
+fn reports_reader(state: &AppState) -> oce_infra::sqlite::reports::ReportsReader {
+    let container = &state.container;
+    // 向量库统计闭包：kind_stats 走属性索引，.tdb 文件体积直接 stat；
+    // 任何失败降级为 unavailable，绝不让报表抛错
+    let trivium = container.application.trivium.clone();
+    let tdb_path = container
+        .settings
+        .trivium
+        .path
+        .clone();
+    let dim = container.vector_dim;
+    let vector_stats = std::sync::Arc::new(move || {
+        let collections = trivium
+            .kind_stats()
+            .into_iter()
+            .map(|(name, rows)| oce_infra::sqlite::reports::VectorCollectionStat {
+                name,
+                rows: rows as u64,
+                est_bytes: 0,
+            })
+            .collect();
+        let file_bytes = std::fs::metadata(&tdb_path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        oce_infra::sqlite::reports::VectorStoreStat {
+            mode: "lite".into(),
+            collections,
+            file_bytes,
+            error: None,
+        }
+    });
+    oce_infra::sqlite::reports::ReportsReader::new(
+        container.db.clone(),
+        container.data_dir.clone(),
+        Some(vector_stats),
+        dim,
+    )
+}
+
+async fn report_api_calls(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiCallsReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let (window_hours, bucket) = report_params(&params);
+    let bucket = validate_bucket(&bucket)?;
+    let report = reports_reader(&state)
+        .api_calls(clamp_window(window_hours), &bucket)
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
+}
+
+async fn report_retrieval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<RetrievalReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let (window_hours, bucket) = report_params(&params);
+    let bucket = validate_bucket(&bucket)?;
+    let report = reports_reader(&state)
+        .retrieval(clamp_window(window_hours), &bucket)
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
+}
+
+async fn report_slow_queries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let window_hours: u32 = params
+        .get("window_hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let items = reports_reader(&state)
+        .slow_queries(clamp_window(window_hours), clamp_limit(limit))
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(serde_json::json!({
+        "window_hours": clamp_window(window_hours),
+        "items": items,
+    })))
+}
+
+async fn report_empty_queries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let window_hours: u32 = params
+        .get("window_hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let limit: u32 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let items = reports_reader(&state)
+        .empty_queries(clamp_window(window_hours), clamp_limit(limit))
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(serde_json::json!({
+        "window_hours": clamp_window(window_hours),
+        "items": items,
+    })))
+}
+
+async fn report_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<TokensReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let (window_hours, bucket) = report_params(&params);
+    let bucket = validate_bucket(&bucket)?;
+    let report = reports_reader(&state)
+        .tokens(clamp_window(window_hours), &bucket)
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
+}
+
+async fn report_index_inventory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<IndexInventoryReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let report = reports_reader(&state)
+        .index_inventory()
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
+}
+
+async fn report_resources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ResourcesReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let (window_hours, bucket) = report_params(&params);
+    let bucket = validate_bucket(&bucket)?;
+    let report = reports_reader(&state)
+        .resources(clamp_window(window_hours), &bucket)
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
+}
+
+async fn report_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<StorageReport>, Response> {
+    verify_admin_key(&headers, &state)?;
+    let report = reports_reader(&state)
+        .storage()
+        .await
+        .map_err(|e| validation_error(&e))?;
+    Ok(Json(report))
 }
 
 fn not_found(message: &str) -> Response {

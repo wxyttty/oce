@@ -14,12 +14,37 @@ pub struct TokenUsageRecord {
     pub total_tokens: u64,
 }
 
+/// 一次 HTTP 请求的调用记录（endpoint 为路由模板路径，/health 豁免）。
+#[derive(Debug, Clone)]
+pub struct ApiCallRecord {
+    pub endpoint: String,
+    pub method: String,
+    pub status_code: u16,
+    pub latency_ms: u64,
+    pub error_type: Option<String>,
+}
+
+/// 一次资源采样快照（磁盘 / 内存 / CPU）。
+#[derive(Debug, Clone)]
+pub struct ResourceSampleRecord {
+    pub disk_data_bytes: u64,
+    pub disk_free_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub mem_rss_bytes: u64,
+    pub mem_percent: f64,
+    pub cpu_percent: f64,
+}
+
 /// 监控采集端口。实现方的 record_* 必须同步、非阻塞、不抛出。
 pub trait MetricsSink: Send + Sync {
     fn record_token_usage(&self, record: TokenUsageRecord);
 
     /// 检索审计落库（阶段耗时 + 空回）。monitoring 关闭时为空实现。
     fn record_retrieval(&self, record: RetrievalMetricRecord);
+
+    fn record_api_call(&self, record: ApiCallRecord);
+
+    fn record_resource_sample(&self, record: ResourceSampleRecord);
 }
 
 /// 一次检索的阶段耗时与结果审计（对应 Python `RetrievalMetricRecord`）。
@@ -44,6 +69,7 @@ pub struct RetrievalMetricRecord {
 
 impl RetrievalMetricRecord {
     /// 从 audit 构造（字段缺失时 None，与 Python 落库行为一致）。
+    /// query_text 默认不落原文（隐私安全）；调用方按 store_query_text 配置覆写。
     pub fn from_audit(audit: &RetrievalAudit, source: &str, hit_count: usize, total_ms: i64) -> Self {
         let stage = |name: &str| audit.stages.get(name).map(|v| *v as i64);
         Self {
@@ -53,7 +79,7 @@ impl RetrievalMetricRecord {
             total_ms,
             intent: audit.intent.clone(),
             path_boosted: audit.path_boosted,
-            query_text: None, // 默认不落 query 原文（隐私安全）
+            query_text: None,
             intent_ms: stage("intent"),
             rewrite_ms: stage("rewrite"),
             dense_ms: stage("dense"),
@@ -72,4 +98,6 @@ pub struct NoopMetricsSink;
 impl MetricsSink for NoopMetricsSink {
     fn record_token_usage(&self, _record: TokenUsageRecord) {}
     fn record_retrieval(&self, _record: RetrievalMetricRecord) {}
+    fn record_api_call(&self, _record: ApiCallRecord) {}
+    fn record_resource_sample(&self, _record: ResourceSampleRecord) {}
 }

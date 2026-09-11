@@ -4,6 +4,7 @@
 pub mod chains;
 pub mod credentials;
 pub mod metrics;
+pub mod reports;
 pub mod repos;
 
 use rusqlite::Connection;

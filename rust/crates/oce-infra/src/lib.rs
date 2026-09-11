@@ -9,6 +9,7 @@
 
 pub mod credentials;
 pub mod openai;
+pub mod resource_sampler;
 pub mod settings;
 pub mod static_embed;
 pub mod sqlite;

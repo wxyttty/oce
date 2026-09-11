@@ -57,6 +57,10 @@ pub struct RetrievalApplication {
     pub chain_repo: Arc<oce_infra::sqlite::chains::SqlChainRepository>,
     pub trivium: oce_infra::trivium::TriviumHandle,
     pub metrics: Option<Arc<oce_infra::sqlite::metrics::SqlMetricsSink>>,
+    /// 检索审计开关（monitoring.enabled && retrieval_audit_enabled，容器装配时定）
+    pub retrieval_audit_enabled: bool,
+    /// 是否落 query 原文（隐私敏感，默认关；开启后供慢查询/空回报表展示）
+    pub store_query_text: bool,
 }
 
 impl RetrievalApplication {
@@ -67,6 +71,8 @@ impl RetrievalApplication {
         chain_repo: Arc<oce_infra::sqlite::chains::SqlChainRepository>,
         trivium: oce_infra::trivium::TriviumHandle,
         metrics: Option<Arc<oce_infra::sqlite::metrics::SqlMetricsSink>>,
+        retrieval_audit_enabled: bool,
+        store_query_text: bool,
     ) -> Self {
         Self {
             indexing,
@@ -75,6 +81,8 @@ impl RetrievalApplication {
             chain_repo,
             trivium,
             metrics,
+            retrieval_audit_enabled,
+            store_query_text,
         }
     }
 
@@ -132,15 +140,20 @@ impl RetrievalApplication {
             .await;
         let elapsed_ms = started.elapsed().as_millis() as i64;
 
-        // 检索审计旁路落库（monitoring 关闭时为 None，零开销跳过）
+        // 检索审计旁路落库（monitoring/audit 关闭时为 None，零开销跳过）
         if let Some(metrics) = &self.metrics {
-            let record = RetrievalMetricRecord::from_audit(
-                &audit,
-                "retrieval",
-                hits.len(),
-                elapsed_ms,
-            );
-            metrics.record_retrieval(record);
+            if self.retrieval_audit_enabled {
+                let mut record = RetrievalMetricRecord::from_audit(
+                    &audit,
+                    "retrieval",
+                    hits.len(),
+                    elapsed_ms,
+                );
+                if self.store_query_text {
+                    record.query_text = Some(information_request.to_string());
+                }
+                metrics.record_retrieval(record);
+            }
         }
 
         let formatted = format_retrieval(&hits);

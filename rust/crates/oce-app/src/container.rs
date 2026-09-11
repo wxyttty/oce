@@ -394,6 +394,10 @@ pub struct Container {
     pub vector_dim: usize,
     pub llm_reranker: Option<Arc<LlmRerankerImpl>>,
     pub rerank_api: Option<Arc<CredentialConfiguredReranker>>,
+    /// 数据目录（SQLite/TriviumDB 所在目录；storage 报表用）。SQLite 相对路径时为 None。
+    pub data_dir: Option<String>,
+    /// 资源采样器（monitoring 关闭时 None；drop 时停止）
+    pub resource_sampler: Option<oce_infra::resource_sampler::ResourceSampler>,
 }
 
 impl Container {
@@ -474,12 +478,29 @@ impl Container {
         // ── 监控（旁路，非阻塞） ──
         let metrics = if settings.monitoring.enabled {
             let sink = Arc::new(SqlMetricsSink::new(db.clone()));
-            let flusher = sink.clone();
-            flusher.spawn_flush_task(settings.monitoring.flush_interval_seconds);
+            sink.clone().spawn_flush_task(settings.monitoring.flush_interval_seconds);
+            sink.clone().spawn_cleanup_task(
+                settings.monitoring.retention_days,
+                settings.monitoring.cleanup_interval_seconds,
+            );
             Some(sink)
         } else {
             None
         };
+        // 数据目录：SQLite 绝对路径时取其父目录（storage/resources 报表用）
+        let data_dir = std::path::Path::new(&sqlite_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .map(|s| s.to_string())
+            .filter(|_| std::path::Path::new(&sqlite_path).is_absolute());
+        // 资源采样：monitoring 开启时后台周期采集（旁路，drop 时停止）
+        let resource_sampler = oce_infra::resource_sampler::ResourceSampler::start(
+            metrics
+                .clone()
+                .map(|m| m as Arc<dyn oce_core::metrics::MetricsSink>),
+            settings.monitoring.resource_sample_interval_seconds,
+            data_dir.clone(),
+        );
         let on_usage: Option<oce_infra::openai::embedder::UsageCallback> = metrics
             .as_ref()
             .map(|m| {
@@ -654,6 +675,8 @@ impl Container {
             chain_repo,
             trivium,
             metrics.clone(),
+            settings.monitoring.enabled && settings.monitoring.retrieval_audit_enabled,
+            settings.monitoring.store_query_text,
         ));
 
         Ok(Arc::new(Self {
@@ -667,6 +690,8 @@ impl Container {
             vector_dim,
             llm_reranker,
             rerank_api,
+            data_dir,
+            resource_sampler,
         }))
     }
 
