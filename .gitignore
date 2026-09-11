@@ -30,3 +30,13 @@ htmlcov/
 
 data
 logs
+# Rust build artifacts
+/rust/**/target/
+
+# Rust generated / backup files
+/rust/**/.rustc_info.json
+/rust/**/*.rs.bk
+/rust/tmp/
+/rust/crates/oce-app/var/folders/
+# macOS
+/rust/**/.DS_Store

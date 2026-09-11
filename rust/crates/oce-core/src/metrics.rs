@@ -1,0 +1,75 @@
+//! 监控旁路的领域侧记录类型（对应 Python `shared/metrics.py` 的 record 类型）。
+//! 采集为旁路且非阻塞：sink 失败只跳过，不影响检索主链路。
+
+use crate::search::RetrievalAudit;
+
+/// 每次外部模型调用一行的 token 消耗记录。
+#[derive(Debug, Clone)]
+pub struct TokenUsageRecord {
+    pub kind: String,
+    pub model: String,
+    pub credential_id: i64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// 监控采集端口。实现方的 record_* 必须同步、非阻塞、不抛出。
+pub trait MetricsSink: Send + Sync {
+    fn record_token_usage(&self, record: TokenUsageRecord);
+
+    /// 检索审计落库（阶段耗时 + 空回）。monitoring 关闭时为空实现。
+    fn record_retrieval(&self, record: RetrievalMetricRecord);
+}
+
+/// 一次检索的阶段耗时与结果审计（对应 Python `RetrievalMetricRecord`）。
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalMetricRecord {
+    pub source: String,
+    pub scope_size: Option<i64>,
+    pub hit_count: i64,
+    pub total_ms: i64,
+    pub intent: Option<String>,
+    pub path_boosted: bool,
+    pub query_text: Option<String>,
+    pub intent_ms: Option<i64>,
+    pub rewrite_ms: Option<i64>,
+    pub dense_ms: Option<i64>,
+    pub exact_ms: Option<i64>,
+    pub fuse_ms: Option<i64>,
+    pub rerank_ms: Option<i64>,
+    pub llm_rerank_ms: Option<i64>,
+    pub select_ms: Option<i64>,
+}
+
+impl RetrievalMetricRecord {
+    /// 从 audit 构造（字段缺失时 None，与 Python 落库行为一致）。
+    pub fn from_audit(audit: &RetrievalAudit, source: &str, hit_count: usize, total_ms: i64) -> Self {
+        let stage = |name: &str| audit.stages.get(name).map(|v| *v as i64);
+        Self {
+            source: source.to_string(),
+            scope_size: audit.scope_size.map(|s| s as i64),
+            hit_count: hit_count as i64,
+            total_ms,
+            intent: audit.intent.clone(),
+            path_boosted: audit.path_boosted,
+            query_text: None, // 默认不落 query 原文（隐私安全）
+            intent_ms: stage("intent"),
+            rewrite_ms: stage("rewrite"),
+            dense_ms: stage("dense"),
+            exact_ms: stage("exact"),
+            fuse_ms: stage("fuse"),
+            rerank_ms: stage("rerank"),
+            llm_rerank_ms: stage("llm_rerank"),
+            select_ms: stage("select"),
+        }
+    }
+}
+
+/// 空实现（监控关闭时）。
+pub struct NoopMetricsSink;
+
+impl MetricsSink for NoopMetricsSink {
+    fn record_token_usage(&self, _record: TokenUsageRecord) {}
+    fn record_retrieval(&self, _record: RetrievalMetricRecord) {}
+}

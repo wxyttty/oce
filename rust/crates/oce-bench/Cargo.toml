@@ -1,0 +1,18 @@
+[package]
+name = "oce-bench"
+description = "OpenContextEngine benchmark harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oce-bench"
+path = "src/main.rs"
+
+[dependencies]
+oce-core = { workspace = true }
+oce-infra = { workspace = true }
+oce-app = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+rusqlite = { workspace = true }

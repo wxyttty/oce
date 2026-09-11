@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oce-core",
+    "crates/oce-infra",
+    "crates/oce-app",
+    "crates/oce-server",
+    "crates/oce-bench",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# 内部 crate
+oce-core = { path = "crates/oce-core" }
+oce-infra = { path = "crates/oce-infra" }
+oce-app = { path = "crates/oce-app" }
+
+# 异步运行时与 Web
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+async-trait = "0.1"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP 客户端（embedding / rerank / LLM）
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"], default-features = false }
+
+# 存储
+triviumdb = "0.8.5"
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+
+# 解析与文本
+regex = "1"
+tree-sitter = "0.25"
+
+# 工具
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+sysinfo = "0.33"
+rand = "0.8"
+ignore = "0.4"
+safetensors = "0.8"
+rayon = "1.12"
+hf-hub = "0.4"
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

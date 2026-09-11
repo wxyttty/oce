@@ -1,0 +1,46 @@
+[package]
+name = "oce-core"
+description = "OpenContextEngine domain core: chunking, retrieval orchestration, protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+# cAST 切块：tree-sitter 语言 grammar（与 Python tree-sitter-language-pack 对齐的子集）
+rayon.workspace = true
+tree-sitter = { workspace = true }
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-kotlin-ng = "1"
+tree-sitter-scala = "0.23"
+tree-sitter-bash = "0.23"
+tree-sitter-lua = "0.5"
+tree-sitter-html = "0.23"
+tree-sitter-haskell = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-erlang = "0.20"
+tree-sitter-clojure = "0.1"
+tree-sitter-zig = "1"
+tree-sitter-cmake = "0.7"
+tokio = { workspace = true }
+
+[dev-dependencies]
