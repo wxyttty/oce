@@ -8,12 +8,14 @@
 //! - [`settings`]: 环境变量配置（与 Python 版前缀兼容）
 
 pub mod credentials;
+pub mod memory_guard;
 pub mod openai;
 pub mod resource_sampler;
 pub mod settings;
-pub mod static_embed;
 pub mod sqlite;
+pub mod static_embed;
 pub mod trivium;
+pub mod candle_embed;
 
 /// 同 run_sql，但闭包直接返回 OceError（需要区分唯一约束冲突时使用）。
 pub(crate) async fn run_sql_oce<T: Send + 'static>(
