@@ -9,13 +9,13 @@
 //!   绝不 mark_ready，避免「有 chunk、零向量」的 blob 被点亮后检索恒空。
 
 use crate::blob::{Blob, BlobStatus};
-use crate::chunk::{is_meaningful, Chunk, LocatedChunk};
+use crate::chunk::lang::detect_language;
 use crate::chunk::Chunker;
+use crate::chunk::{is_meaningful, Chunk, LocatedChunk};
 use crate::error::OceResult;
 use crate::path_doc::{build_path_document, is_indexable_path};
 use crate::search::{Embedder, PathDoc, PathSearchStore, VectorIndex, VectorUpsert};
 use crate::source_filter::{is_binary_source, is_ignored_source_path};
-use crate::chunk::lang::detect_language;
 use async_trait::async_trait;
 use rayon::prelude::*;
 
@@ -45,10 +45,19 @@ pub trait BlobRepository: Send + Sync {
     /// 按 last_seen 找过期 blob（GC 用）。
     async fn find_expired(&self, ttl_days: u32, batch_size: usize) -> OceResult<Vec<String>>;
     /// 批量存在性检查。
-    async fn exists_many(&self, blob_names: &[String]) -> OceResult<std::collections::HashMap<String, bool>>;
-    async fn get_many(&self, blob_names: &[String]) -> OceResult<std::collections::HashMap<String, Blob>>;
+    async fn exists_many(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<std::collections::HashMap<String, bool>>;
+    async fn get_many(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<std::collections::HashMap<String, Blob>>;
     /// 取已存在但未嵌入的 chunk 出现位置（LocatedChunk），按 blob 批量。
-    async fn find_pending_chunks_for_blobs(&self, blob_names: &[String]) -> OceResult<Vec<LocatedChunk>>;
+    async fn find_pending_chunks_for_blobs(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<Vec<LocatedChunk>>;
     /// 保存切块结果（chunk 内容按 content_hash 去重 + blob_chunk 出现位置）。
     async fn save_chunks(&self, blob_name: &str, chunks: &[Chunk]) -> OceResult<()>;
     /// 批量保存多个 blob 的切块结果。默认逐个转发；基础设施可覆写为单事务批量。
@@ -86,6 +95,9 @@ pub struct IndexingPipeline {
     pub path_store: Option<std::sync::Arc<dyn PathSearchStore>>,
     pub embedding_gate: std::sync::Arc<dyn EmbeddingGate>,
     pub embed_batch_size: usize,
+    /// 规则层文件描述注入 embedding_text（RETRIEVAL_FILE_DESC_ENABLED）。
+    /// 改变嵌入文本语义，开启时模型指纹带 etext=v2 强制重建索引。
+    pub file_desc_enabled: bool,
 }
 
 impl IndexingPipeline {
@@ -105,6 +117,7 @@ impl IndexingPipeline {
             path_store,
             embedding_gate,
             embed_batch_size: 64,
+            file_desc_enabled: false,
         }
     }
 
@@ -160,10 +173,16 @@ impl IndexingPipeline {
         blob_names: Option<&[String]>,
         mark_failures: bool,
     ) -> OceResult<usize> {
+        let t_start = std::time::Instant::now();
         let blobs = self.blob_repo.find_pending(blob_names).await?;
         if blobs.is_empty() {
             return Ok(0);
         }
+        tracing::info!(
+            "[perf] embed_pending enter: blobs={} find={:?}",
+            blobs.len(),
+            t_start.elapsed()
+        );
 
         let mut ready_blobs: Vec<Blob> = Vec::new();
 
@@ -176,17 +195,16 @@ impl IndexingPipeline {
             .filter(|b| b.chunks.is_empty())
             .map(|b| b.blob_name.clone())
             .collect();
-        let staging_map: std::collections::HashMap<String, Option<String>> = if need_chunk_names
-            .is_empty()
-        {
-            std::collections::HashMap::new()
-        } else {
-            self.blob_repo
-                .get_staging_many(&need_chunk_names)
-                .await?
-                .into_iter()
-                .collect()
-        };
+        let staging_map: std::collections::HashMap<String, Option<String>> =
+            if need_chunk_names.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                self.blob_repo
+                    .get_staging_many(&need_chunk_names)
+                    .await?
+                    .into_iter()
+                    .collect()
+            };
         let mut to_chunk: Vec<(&Blob, String)> = Vec::new();
         for blob in &blobs {
             if blob.chunks.is_empty() {
@@ -237,21 +255,68 @@ impl IndexingPipeline {
             }
         }
 
-
         // 嵌入开关关闭：切块已落库，但没有任何向量。保持 pending 且保留 staging，
         // 待开关恢复、blob 重新入队后补嵌。
         if !self.embedding_gate.enabled() {
             return Ok(0);
         }
+        tracing::info!(
+            "[perf] stage1 chunk done: blobs={} elapsed={:?}",
+            blobs.len(),
+            t_start.elapsed()
+        );
 
-        // 第二阶段：嵌入
+        // 第二阶段：嵌入。描述注入需要文件级 staging 内容（README 首段），
+        let t_stage2 = std::time::Instant::now();
+        // 与切块阶段共用同一 staging_map；切块阶段可能已消费过，这里按需补取。
+        let desc_names: Vec<String> = if self.file_desc_enabled {
+            blobs
+                .iter()
+                .filter(|b| {
+                    crate::file_desc::description_needs_content(&b.path)
+                        && !staging_map.contains_key(&b.blob_name)
+                })
+                .map(|b| b.blob_name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let desc_staging = if desc_names.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.blob_repo
+                .get_staging_many(&desc_names)
+                .await?
+                .into_iter()
+                .collect::<std::collections::HashMap<String, Option<String>>>()
+        };
+        let mut file_descs: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if self.file_desc_enabled {
+            for blob in &blobs {
+                if !file_descs.contains_key(&blob.blob_name) {
+                    let content = staging_map
+                        .get(&blob.blob_name)
+                        .or_else(|| desc_staging.get(&blob.blob_name))
+                        .and_then(|c| c.as_deref());
+                    let desc =
+                        crate::file_desc::file_description(&blob.path, content.unwrap_or(""));
+                    if !desc.is_empty() {
+                        file_descs.insert(blob.blob_name.clone(), desc);
+                    }
+                }
+            }
+        }
         let names: Vec<String> = blobs.iter().map(|b| b.blob_name.clone()).collect();
         let pending = self.blob_repo.find_pending_chunks_for_blobs(&names).await?;
         let mut embedded = 0usize;
 
         let result: OceResult<()> = async {
             for batch in pending.chunks(self.embed_batch_size) {
-                let texts: Vec<String> = batch.iter().map(|c| embedding_text(c)).collect();
+                let texts: Vec<String> = batch
+                    .iter()
+                    .map(|c| embedding_text(c, file_descs.get(&c.blob_name).map(String::as_str)))
+                    .collect();
                 let vectors = self.embedder.embed_documents(texts).await?;
                 if vectors.len() != batch.len() {
                     return Err(crate::error::OceError::new(
@@ -279,7 +344,12 @@ impl IndexingPipeline {
                     .collect();
                 self.vector_index.upsert(items).await?;
                 self.blob_repo
-                    .mark_embedded(&batch.iter().map(|c| c.content_hash.clone()).collect::<Vec<_>>())
+                    .mark_embedded(
+                        &batch
+                            .iter()
+                            .map(|c| c.content_hash.clone())
+                            .collect::<Vec<_>>(),
+                    )
                     .await?;
                 embedded += batch.len();
             }
@@ -299,6 +369,11 @@ impl IndexingPipeline {
         }
 
         // 第三阶段：标记 ready + 清理 staging
+        tracing::info!(
+            "[perf] stage2 embed done: blobs={} elapsed={:?}",
+            blobs.len(),
+            t_stage2.elapsed()
+        );
         for blob in &blobs {
             if blob.status == BlobStatus::Pending {
                 let mut b = blob.clone();
@@ -310,23 +385,39 @@ impl IndexingPipeline {
         }
 
         // 路径索引写入失败不应影响主索引（chunk 已嵌入、blob 已 ready），仅记日志
+        let t_stage3 = std::time::Instant::now();
         self.index_paths(&ready_blobs).await;
+        tracing::info!(
+            "[perf] stage3 ready+paths done: blobs={} elapsed={:?}",
+            ready_blobs.len(),
+            t_stage3.elapsed()
+        );
         Ok(embedded)
     }
 
     /// 把 ready blob 的路径写入路径索引（文件名查询专用通道）。
     /// 放在 embed_pending 完成后统一批量写入，避免 ingest 阶段多一次 embedding。
     async fn index_paths(&self, blobs: &[Blob]) {
+        let t_paths = std::time::Instant::now();
         let Some(path_store) = &self.path_store else {
             return;
         };
-        let indexable: Vec<&Blob> = blobs.iter().filter(|b| is_indexable_path(&b.path)).collect();
+        let indexable: Vec<&Blob> = blobs
+            .iter()
+            .filter(|b| is_indexable_path(&b.path))
+            .collect();
         if indexable.is_empty() {
             return;
         }
         let docs: Vec<(String, String, String)> = indexable
             .iter()
-            .map(|b| (b.blob_name.clone(), b.path.clone(), build_path_document(&b.path)))
+            .map(|b| {
+                (
+                    b.blob_name.clone(),
+                    b.path.clone(),
+                    build_path_document(&b.path),
+                )
+            })
             .collect();
         let texts: Vec<String> = docs.iter().map(|(_, _, doc)| doc.clone()).collect();
         match self.embedder.embed_documents(texts).await {
@@ -344,8 +435,14 @@ impl IndexingPipeline {
                     .collect();
                 let count = path_docs.len();
                 match path_store.insert(path_docs).await {
-                    Ok(_) => tracing::info!("path index write: {} blobs", count),
-                    Err(exc) => tracing::warn!("path index write failed for {} blobs: {}", count, exc),
+                    Ok(_) => tracing::info!(
+                        "path index write: {} blobs elapsed={:?}",
+                        count,
+                        t_paths.elapsed()
+                    ),
+                    Err(exc) => {
+                        tracing::warn!("path index write failed for {} blobs: {}", count, exc)
+                    }
                 }
             }
             Err(exc) => tracing::warn!("path index embed failed: {}", exc),
@@ -354,8 +451,15 @@ impl IndexingPipeline {
 }
 
 /// 嵌入输入文本（与 Python `LocatedChunk.embedding_text` 一致）。
-fn embedding_text(chunk: &LocatedChunk) -> String {
-    format!("File: {}\n\n{}", chunk.path, chunk.content)
+/// description 非空时插入 path 与正文之间（借鉴 BCE embedDocText：
+/// 清单/配置文件的桥接句让自然语言查询够得着无词法重叠的内容）。
+fn embedding_text(chunk: &LocatedChunk, description: Option<&str>) -> String {
+    match description {
+        Some(desc) if !desc.is_empty() => {
+            format!("File: {}\n{}\n\n{}", chunk.path, desc, chunk.content)
+        }
+        _ => format!("File: {}\n\n{}", chunk.path, chunk.content),
+    }
 }
 
 /// 判定内容是否可切块（re-export 便捷用）。
