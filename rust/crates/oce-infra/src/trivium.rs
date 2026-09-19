@@ -93,9 +93,7 @@ impl TriviumStore {
         let db = self.r();
         let mut out = Vec::new();
         for kind in [KIND_CHUNK, KIND_PATH] {
-            let tql = format!(
-                "FIND {{kind: \"{kind}\"}} RETURN count(*) AS rows"
-            );
+            let tql = format!("FIND {{kind: \"{kind}\"}} RETURN count(*) AS rows");
             let Ok(rows) = db.tql(&tql) else {
                 continue;
             };
@@ -184,13 +182,17 @@ impl TriviumStore {
             };
             match db.get_payload(id) {
                 Some(existing) => {
-                    if existing.get("chunk_id").and_then(|v| v.as_str()) == Some(item.chunk_id.as_str())
+                    if existing.get("chunk_id").and_then(|v| v.as_str())
+                        == Some(item.chunk_id.as_str())
                     {
                         // 幂等重放：覆盖向量与 payload
-                        db.update_vector(id, &item.vector).map_err(|e| e.to_string())?;
-                        db.update_payload(id, payload.clone()).map_err(|e| e.to_string())?;
+                        db.update_vector(id, &item.vector)
+                            .map_err(|e| e.to_string())?;
+                        db.update_payload(id, payload.clone())
+                            .map_err(|e| e.to_string())?;
                         if self.text_hybrid {
-                            db.index_text(id, &item.content).map_err(|e| e.to_string())?;
+                            db.index_text(id, &item.content)
+                                .map_err(|e| e.to_string())?;
                         }
                         return Ok(());
                     }
@@ -201,7 +203,8 @@ impl TriviumStore {
                     db.insert_with_id(id, &item.vector, payload.clone())
                         .map_err(|e| e.to_string())?;
                     if self.text_hybrid {
-                        db.index_text(id, &item.content).map_err(|e| e.to_string())?;
+                        db.index_text(id, &item.content)
+                            .map_err(|e| e.to_string())?;
                     }
                     return Ok(());
                 }
@@ -260,9 +263,7 @@ impl TriviumStore {
     /// 按 kind + blob_name 过滤取全部节点 ID（TQL FIND，属性索引加速）。
     fn ids_by_kind_blob(&self, kind: &str, blob_name: &str) -> Result<Vec<NodeId>, String> {
         let db = self.r();
-        let tql = format!(
-            "FIND {{kind: \"{kind}\", blob_name: \"{blob_name}\"}} RETURN *"
-        );
+        let tql = format!("FIND {{kind: \"{kind}\", blob_name: \"{blob_name}\"}} RETURN *");
         let rows = db.tql_nodes(&tql).map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
@@ -299,27 +300,40 @@ impl TriviumStore {
             enable_advanced_pipeline: false,
             // BM25 稀疏 + dense 加权 RRF 融合（CJK 2-gram 分词，中文词法兜底）
             enable_text_hybrid_search: self.text_hybrid,
-            text_boost: 1.5,
+            text_boost: self.settings.text_boost,
             force_brute_force,
             ..Default::default()
         };
-        // 概念投影只作用于概念型查询（Feature/Overview/Compound）的词法通道：
-        // PATH/SYMBOL 查询的 BM25 词法是精确信号，灌入别名 token 反而淹没目标
-        // （实测 flask file_exact 类 -10 分的根因）。
-        let enriched = query_text
+        // BM25 词法路的标识符门控：query 里的普通词（中文语义词、flask/python
+        // 这类仓库名）在全文词法匹配中命中海量文件，把 dense 语义排序冲垮
+        // （实测 flask 无门控 -20 分、仅概念投影门控 -19 分的根因）；
+        // 只有代码标识符是可靠的词法精确信号。
+        // 有标识符 → BM25 只喂标识符；无标识符 → None（BM25 路整体关闭，
+        // TriviumDB 对 None query_text 跳过词法召回）。
+        let lexical_query: Option<String> = query_text
             .filter(|_| kind == KIND_CHUNK)
-            .filter(|q| {
-                matches!(
-                    oce_core::classifier::classify_query_intent(q),
-                    oce_core::classifier::Intent::Feature
-                        | oce_core::classifier::Intent::Overview
-                        | oce_core::classifier::Intent::Compound
-                )
-            })
-            .map(oce_core::lexical::enrich_lexical_query);
+            .and_then(|q| {
+                let ids = oce_core::classifier::extract_code_identifiers(q);
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(ids.join(" "))
+                }
+            });
+        // path 节点检索保留原文本：path document 本身就是词法化文本，
+        // BM25 对它是精确匹配（文件名 token），不是噪音源。
+        let text_for_engine: Option<&str> = if kind == KIND_CHUNK {
+            lexical_query.as_deref()
+        } else {
+            query_text
+        };
         let db = self.r();
         let hits = db
-            .search_hybrid(enriched.as_deref().or(query_text), Some(query_vector), &config)
+            .search_hybrid(
+                text_for_engine,
+                Some(query_vector),
+                &config,
+            )
             .map_err(|e| e.to_string())?;
         Ok(hits.into_iter().filter_map(payload_to_hit).collect())
     }
@@ -339,10 +353,13 @@ impl TriviumStore {
                 if existing.get("path_id").and_then(|v| v.as_str())
                     == Some(doc.path_id.as_str()) =>
             {
-                db.update_vector(id, &doc.path_vector).map_err(|e| e.to_string())?;
-                db.update_payload(id, payload.clone()).map_err(|e| e.to_string())?;
+                db.update_vector(id, &doc.path_vector)
+                    .map_err(|e| e.to_string())?;
+                db.update_payload(id, payload.clone())
+                    .map_err(|e| e.to_string())?;
                 if self.text_hybrid {
-                    db.index_text(id, &doc.path_document).map_err(|e| e.to_string())?;
+                    db.index_text(id, &doc.path_document)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(())
             }
@@ -351,7 +368,8 @@ impl TriviumStore {
                 db.insert_with_id(salted, &doc.path_vector, payload.clone())
                     .map_err(|e| e.to_string())?;
                 if self.text_hybrid {
-                    db.index_text(salted, &doc.path_document).map_err(|e| e.to_string())?;
+                    db.index_text(salted, &doc.path_document)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(())
             }
@@ -359,7 +377,8 @@ impl TriviumStore {
                 db.insert_with_id(id, &doc.path_vector, payload.clone())
                     .map_err(|e| e.to_string())?;
                 if self.text_hybrid {
-                    db.index_text(id, &doc.path_document).map_err(|e| e.to_string())?;
+                    db.index_text(id, &doc.path_document)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(())
             }
@@ -442,14 +461,22 @@ impl SearchStore for TriviumStore {
         let qv = query_vector.to_vec();
         let blob_filter: Option<Vec<String>> = allowed_blob_names.map(|s| s.to_vec());
         blocking(|| {
-            self.search_sync(Some(query), &qv, KIND_CHUNK, blob_filter.as_deref(), top_k, vector_threshold, false)
-                .map(|hits| {
-                    // 后过滤（与 Python `score < vector_threshold: continue` 一致）
-                    hits.into_iter()
-                        .filter(|(hit, _)| hit.score >= vector_threshold)
-                        .map(|(hit, _)| hit)
-                        .collect()
-                })
+            self.search_sync(
+                Some(query),
+                &qv,
+                KIND_CHUNK,
+                blob_filter.as_deref(),
+                top_k,
+                vector_threshold,
+                false,
+            )
+            .map(|hits| {
+                // 后过滤（与 Python `score < vector_threshold: continue` 一致）
+                hits.into_iter()
+                    .filter(|(hit, _)| hit.score >= vector_threshold)
+                    .map(|(hit, _)| hit)
+                    .collect()
+            })
         })
     }
 }
@@ -467,7 +494,8 @@ impl VectorIndex for TriviumStore {
             self.end_bulk_load()?;
             // 同文件边：批量去重后逐 blob 建链（扩散召回通道）
             if self.expand_depth > 0 {
-                let mut blobs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                let mut blobs: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
                 for item in &items {
                     blobs.insert(item.blob_name.clone());
                 }
@@ -502,16 +530,27 @@ impl PathSearchStore for TriviumStore {
         let qv = query_vector.to_vec();
         let blob_filter: Option<Vec<String>> = allowed_blob_names.map(|s| s.to_vec());
         blocking(|| {
-            self.search_sync(Some(query), &qv, KIND_PATH, blob_filter.as_deref(), top_k, 0.0, false)
-                .map(|hits| {
-                    hits.into_iter()
-                        .map(|(hit, score)| PathSearchResult {
-                            path: hit.path,
-                            blob_name: hit.blob_name,
-                            score,
-                        })
-                        .collect()
-                })
+            // path 检索纯 dense：path document 是词法化文本，query 的中文
+            // 2-gram 对它做 BM25 会把「配置」等泛词匹配到大量路径，压过
+            // 路径向量排序（实测 path 路开 BM25 后 file_exact 类再 -1.5 分）。
+            self.search_sync(
+                None,
+                &qv,
+                KIND_PATH,
+                blob_filter.as_deref(),
+                top_k,
+                0.0,
+                false,
+            )
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|(hit, score)| PathSearchResult {
+                        path: hit.path,
+                        blob_name: hit.blob_name,
+                        score,
+                    })
+                    .collect()
+            })
         })
     }
 

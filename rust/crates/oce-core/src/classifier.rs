@@ -74,29 +74,82 @@ fn filename_token_pattern() -> &'static Regex {
 }
 
 const CALL_VERBS: [&str; 19] = [
-    "调用", "触发", "执行", "从", "到", "路径", "流程", "完整", "如何被", "如何从", "call",
-    "invoke", "trigger", "execute", "from", "to", "path", "flow", "pipeline",
+    "调用",
+    "触发",
+    "执行",
+    "从",
+    "到",
+    "路径",
+    "流程",
+    "完整",
+    "如何被",
+    "如何从",
+    "call",
+    "invoke",
+    "trigger",
+    "execute",
+    "from",
+    "to",
+    "path",
+    "flow",
+    "pipeline",
 ];
 
 const REFERENCE_VERBS: [&str; 11] = [
-    "使用", "引用", "导入", "依赖", "消费", "接收", "use", "import", "depend", "consume",
-    "receive",
+    "使用", "引用", "导入", "依赖", "消费", "接收", "use", "import", "depend", "consume", "receive",
 ];
 
 const OVERVIEW_KEYWORDS: [&str; 15] = [
-    "架构", "实现", "事件处理", "状态管理", "调度", "机制", "流程", "architecture",
-    "implementation", "event handling", "state management", "scheduling", "dispatch",
-    "mechanism", "workflow",
+    "架构",
+    "实现",
+    "事件处理",
+    "状态管理",
+    "调度",
+    "机制",
+    "流程",
+    "architecture",
+    "implementation",
+    "event handling",
+    "state management",
+    "scheduling",
+    "dispatch",
+    "mechanism",
+    "workflow",
 ];
 
 const PATH_KEYWORDS: [&str; 12] = [
-    "文件", "配置", "在哪里", "在哪", "哪个文件", "翻译文件", "依赖", "file", "config",
-    "where", "location", "dependency",
+    "文件",
+    "配置",
+    "在哪里",
+    "在哪",
+    "哪个文件",
+    "翻译文件",
+    "依赖",
+    "file",
+    "config",
+    "where",
+    "location",
+    "dependency",
 ];
 
 const FEATURE_MARKERS: [&str; 18] = [
-    "功能", "实现", "逻辑", "代码", "机制", "策略", "如何", "怎样", "怎么", "feature",
-    "implement", "implementation", "logic", "code", "mechanism", "strategy", "behavior",
+    "功能",
+    "实现",
+    "逻辑",
+    "代码",
+    "机制",
+    "策略",
+    "如何",
+    "怎样",
+    "怎么",
+    "feature",
+    "implement",
+    "implementation",
+    "logic",
+    "code",
+    "mechanism",
+    "strategy",
+    "behavior",
     "how",
 ];
 
@@ -177,8 +230,6 @@ pub fn classify_query_intent(query: &str) -> Intent {
     }
     Intent::Feature
 }
-
-
 
 /// 查询是否包含代码标识符。
 pub fn has_code_identifier(query: &str) -> bool {
@@ -270,7 +321,9 @@ mod tests {
 
     #[test]
     fn extract_identifiers_dedup_and_order() {
-        let ids = extract_code_identifiers("参考 `delete_profile` 和 delete_profile 与 DeleteProfileConfig::new");
+        let ids = extract_code_identifiers(
+            "参考 `delete_profile` 和 delete_profile 与 DeleteProfileConfig::new",
+        );
         assert_eq!(ids.first().map(String::as_str), Some("delete_profile"));
         assert!(ids.contains(&"DeleteProfileConfig::new".to_string()));
     }
@@ -283,9 +336,6 @@ mod tests {
             Intent::Symbol
         );
     }
-
-
-
 
     #[test]
     fn should_use_path_index_semantics() {

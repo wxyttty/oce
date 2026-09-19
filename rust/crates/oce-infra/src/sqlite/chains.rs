@@ -6,8 +6,8 @@ use crate::sqlite::SqlDb;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use oce_core::chain::Chain;
-use oce_core::indexing::BlobRepository;
 use oce_core::error::{OceError, OceResult};
+use oce_core::indexing::BlobRepository;
 use oce_core::search::{search_hit_key, ExactSearchStore, SearchHit};
 use std::collections::{HashMap, HashSet};
 
@@ -17,12 +17,14 @@ pub struct SqlChainRepository {
 }
 
 impl SqlChainRepository {
-    fn row_to_chain(conn: &rusqlite::Connection, row: &rusqlite::Row) -> Result<Chain, rusqlite::Error> {
+    fn row_to_chain(
+        conn: &rusqlite::Connection,
+        row: &rusqlite::Row,
+    ) -> Result<Chain, rusqlite::Error> {
         let chain_id: String = row.get(0)?;
         let version: i64 = row.get(1)?;
         let mut members = HashSet::new();
-        let mut stmt = conn
-            .prepare("SELECT blob_name FROM chain_members WHERE chain_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT blob_name FROM chain_members WHERE chain_id = ?1")?;
         let rows = stmt.query_map([&chain_id], |r| r.get::<_, String>(0))?;
         for m in rows.flatten() {
             members.insert(m);
@@ -57,7 +59,9 @@ impl SqlChainRepository {
             let mut stmt = conn
                 .prepare("SELECT COUNT(*) FROM chains WHERE chain_id = ?1")
                 .map_err(|e| e.to_string())?;
-            let count: i64 = stmt.query_row([&id], |r| r.get(0)).map_err(|e| e.to_string())?;
+            let count: i64 = stmt
+                .query_row([&id], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
             Ok(count > 0)
         })
         .await
@@ -272,13 +276,21 @@ impl ExactSearchStore for SqlExactStore {
                 sql.push_str(" LIMIT ");
                 sql.push_str(&limit.to_string());
 
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                    idents.iter().map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>).collect();
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = idents
+                    .iter()
+                    .map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>)
+                    .collect();
                 if let Some(scope) = &scope {
-                    params.extend(scope.iter().map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>));
+                    params.extend(
+                        scope
+                            .iter()
+                            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>),
+                    );
                 }
-                let params_ref: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|p| p.as_ref() as &dyn rusqlite::ToSql).collect();
+                let params_ref: Vec<&dyn rusqlite::ToSql> = params
+                    .iter()
+                    .map(|p| p.as_ref() as &dyn rusqlite::ToSql)
+                    .collect();
 
                 let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
                 let rows = stmt
@@ -313,10 +325,96 @@ impl ExactSearchStore for SqlExactStore {
                     });
                 }
                 hits.sort_by(|a, b| {
-                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 hits.truncate(top_k);
                 Ok(hits)
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
+
+    /// related symbols hints 的定义查询：identifier → (kind, path, fanout)。
+    /// fanout 在 SQL 侧算（COUNT(DISTINCT blob_name) 窗口函数）；
+    /// endpoint 优先由排序保证（kind='endpoint' 在前）。
+    async fn find_definitions(
+        &self,
+        identifiers: &[String],
+        allowed_blob_names: Option<&[String]>,
+    ) -> OceResult<Vec<oce_core::related::SymbolDefinition>> {
+        let mut identifiers: Vec<String> = identifiers.to_vec();
+        identifiers.dedup();
+        identifiers.retain(|s| !s.is_empty());
+        if identifiers.is_empty() {
+            return Ok(vec![]);
+        }
+        if let Some(scope) = allowed_blob_names {
+            if self.max_scope_blobs > 0 && scope.len() > self.max_scope_blobs {
+                return Ok(vec![]);
+            }
+        }
+
+        let db = self.db.clone();
+        let idents = identifiers.clone();
+        let scope: Option<Vec<String>> = allowed_blob_names.map(|s| s.to_vec());
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let mut sql = format!(
+                    "SELECT so.identifier, so.kind, b.path,
+                            COUNT(*) OVER (PARTITION BY so.identifier) AS fanout
+                     FROM (SELECT DISTINCT identifier, blob_name, kind FROM symbol_occurrences) so
+                     JOIN blobs b ON so.blob_name = b.blob_name
+                     WHERE so.identifier IN ({placeholders})",
+                    placeholders = vec!["?"; idents.len()].join(", ")
+                );
+                if let Some(scope) = &scope {
+                    sql.push_str(&format!(
+                        " AND so.blob_name IN ({})",
+                        vec!["?"; scope.len()].join(", ")
+                    ));
+                }
+                // 同名多定义：endpoint 在前、fanout 升序（低 fanout = 更具体），
+                // 取首见即可（core 侧 or_insert 首见胜出）。
+                // LIMIT 只截行不截标识符：fanout 是窗口函数（PARTITION BY identifier
+                // 全量计算后排序），截断只影响尾部标识符的候选行数，不影响已返回
+                // 标识符的 fanout 值——门控判定不受 LIMIT 影响。
+                sql.push_str(
+                    " ORDER BY so.identifier, CASE so.kind WHEN 'endpoint' THEN 0 ELSE 1 END, fanout",
+                );
+                sql.push_str(" LIMIT 500");
+
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = idents
+                    .iter()
+                    .map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>)
+                    .collect();
+                if let Some(scope) = &scope {
+                    params.extend(
+                        scope
+                            .iter()
+                            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::ToSql>),
+                    );
+                }
+                let params_ref: Vec<&dyn rusqlite::ToSql> = params
+                    .iter()
+                    .map(|p| p.as_ref() as &dyn rusqlite::ToSql)
+                    .collect();
+
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params_ref.as_slice(), |row| {
+                        Ok(oce_core::related::SymbolDefinition {
+                            identifier: row.get(0)?,
+                            kind: row.get(1)?,
+                            path: row.get(2)?,
+                            file_fanout: row.get::<_, i64>(3)? as usize,
+                        })
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.flatten().collect())
             })
         })
         .await
@@ -427,4 +525,56 @@ pub async fn content_map(
         Ok(out)
     })
     .await
+}
+
+/// span 合并/补全的行文本重构（RETRIEVAL_SPAN_MERGE_ENABLED）。
+/// blobs 表不存原文，内容按 blob_chunks → chunks 行号拼接：行号 = chunk
+/// 起始行 + 块内偏移，跨 chunk 覆盖有洞时由调用方按缺行回退。
+pub struct SqlFileContentLookup {
+    pub db: SqlDb,
+}
+
+#[async_trait]
+impl oce_core::retrieval::FileContentLookup for SqlFileContentLookup {
+    async fn blob_lines(
+        &self,
+        blob_names: &[String],
+    ) -> Result<Vec<(String, Vec<(u32, String)>)>, String> {
+        let db = self.db.clone();
+        let names: Vec<String> = blob_names.to_vec();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let mut out = Vec::new();
+                for name in &names {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT bc.start_line, c.content
+                             FROM blob_chunks bc
+                             JOIN chunks c ON c.content_hash = bc.content_hash
+                             WHERE bc.blob_name = ?1
+                             ORDER BY bc.start_line, bc.end_line",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    // 行号 → 文本，先到先得（chunk 间重叠时保留首个起始行的文本）
+                    let mut lines: std::collections::BTreeMap<u32, String> = Default::default();
+                    let mut rows = stmt.query([name]).map_err(|e| e.to_string())?;
+                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        let start: u32 = row.get::<_, i64>(0).map_err(|e| e.to_string())? as u32;
+                        let content: String = row.get(1).map_err(|e| e.to_string())?;
+                        for (offset, text) in content.split('\n').enumerate() {
+                            lines
+                                .entry(start + offset as u32)
+                                .or_insert_with(|| text.to_string());
+                        }
+                    }
+                    if !lines.is_empty() {
+                        out.push((name.clone(), lines.into_iter().collect()));
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
