@@ -69,8 +69,12 @@ pub struct TriviumSettings {
     pub storage_mode: String,
     /// 向量维度（与 EMBED_DIMENSIONS 必须一致）
     pub dense_dim: usize,
-    /// BM25 稀疏文本混合检索（CJK 2-gram 分词，中文词法兜底）。
+    /// BM25 稀疏文本混合检索（标识符门控：仅 query 里的代码标识符进 BM25，
+    /// 无标识符时词法路关闭；flask +4.40 / cc-switch +1.13 vs 全关）。
     pub text_hybrid: bool,
+    /// BM25 路 RRF 融合权重（TRIVIUM_TEXT_BOOST，默认 0.8）：
+    /// 词法信号只做锦上添花，不应压过 dense 语义排序。
+    pub text_boost: f32,
     /// SA-PPR 图扩散深度（TRIVIUM_EXPAND_DEPTH，0=关闭）
     pub expand_depth: usize,
     /// 是否允许查询自动构建 QuIVer ANN。
@@ -86,7 +90,13 @@ impl TriviumSettings {
             sync_mode: var("TRIVIUM_SYNC_MODE").unwrap_or_else(|| "normal".into()),
             storage_mode: var("TRIVIUM_STORAGE_MODE").unwrap_or_else(|| "rom".into()),
             dense_dim: var_parse("MILVUS_DENSE_DIM", 1024usize),
+            // 默认 false：BM25 全词匹配对中文语义 query 是净伤害（flask 实测 -20 分）；
+            // 词法精确信号已由 symbol_occurrences exact 路承担。开启时
+            // trivium.rs 的标识符门控生效（仅真标识符进 BM25）。
+            // 标识符门控 + 低权重 BM25：flask +4.40 / cc-switch +1.13（vs 全关）。
+            // 词法信号只做锦上添花，不应压过 dense 语义排序。
             text_hybrid: var_bool("TRIVIUM_TEXT_HYBRID", true),
+            text_boost: var_parse("TRIVIUM_TEXT_BOOST", 0.3f32),
             expand_depth: var_parse("TRIVIUM_EXPAND_DEPTH", 0usize),
             auto_build_quiver: var_bool("TRIVIUM_AUTO_BUILD_QUIVER", false),
         }
@@ -106,24 +116,36 @@ pub struct EmbeddingSettings {
     pub max_input_chars: usize,
     pub input_overlap_chars: usize,
     pub max_concurrency: usize,
+    /// llama.cpp 后端批量请求在单 slot 内串行处理；true 时拆批量
+    /// 为并发单条请求，利用服务端多 slot 并行（实测长文本 7 倍提速）。
+    /// 对真 OpenAI 兼容 API（SiliconFlow/Gitee）应保持 false——批量接口本身并行。
+    pub single_request: bool,
     pub timeout_seconds: f64,
     pub proxy: Option<String>,
     pub query_instruction: String,
-    /// 向量化提供方：auto（有 key/凭据→openai，否则 static）| static | openai
+    /// 指令模板格式：none = 裸拼接 {}{}；instruct_query = Instruct: {}\nQuery: {}
+    pub instruction_template: String,
+    /// 向量化提供方：auto（有 key/凭据→openai，否则 static）| static | openai | local
     pub provider: String,
     /// 静态模型：HF repo id 或本地目录（默认 minishlab/potion-base-8M）
     pub static_model: Option<String>,
-    /// 本地神经嵌入模型（EMBED_PROVIDER=local）：HF repo id 或本地目录
-    /// llama 路线的 GGUF 文件名（repo 内）
-    /// 权重存储精度：f32 | f16 | bf16 | int8 | int4（量化后反回 F32 计算，
-    /// 测量的是存储精度对质量的影响；真 int 算力需 ort/GGUF 内核）
     /// 静态模型本地目录（优先于 repo id 下载）
     pub static_model_dir: Option<String>,
+    /// 本地 candle 模型：HF repo id 或本地目录（默认 Qwen/Qwen3-Embedding-0.6B）
+    pub local_model: Option<String>,
+    /// 本地 candle 精度：f32|f16|bf16（默认 f32）
+    pub local_dtype: Option<String>,
 }
 
 impl EmbeddingSettings {
     #[doc(hidden)]
     pub fn from_env() -> Self {
+        // 模型名检测需在 struct 初始化外计算（Rust 不允许 let 在字段间）
+        let model_for_instruct = var("EMBED_MODEL").unwrap_or_default();
+        let model_lower = model_for_instruct.to_lowercase();
+        let needs_instruct = model_lower.contains("qwen3-embedding")
+            || model_lower.contains("qwen3_embed")
+            || model_lower.contains("f2llm");
         Self {
             enabled: var_bool("EMBED_ENABLED", true),
             endpoint: var("EMBED_ENDPOINT")
@@ -136,23 +158,32 @@ impl EmbeddingSettings {
             max_input_chars: var_parse("EMBED_MAX_INPUT_CHARS", 8_000usize),
             input_overlap_chars: var_parse("EMBED_INPUT_OVERLAP_CHARS", 400usize),
             max_concurrency: var_parse("EMBED_MAX_CONCURRENCY", 4usize),
+            single_request: var_bool("EMBED_SINGLE_REQUEST", false),
             timeout_seconds: var_parse("EMBED_TIMEOUT_SECONDS", 60.0f64),
             proxy: var("EMBED_PROXY"),
-            // Qwen3-Embedding 官方支持 query 侧 instruction（训练时即指令感知），
-            // 代码检索场景实测 nollm 双仓 +1.1/+2.4 分。模型条件默认：Qwen3 系列
-            // 自动启用；其他嵌入模型保持 Python 原默认（空，不引入未训练指令的
-            // 干扰）；EMBED_QUERY_INSTRUCTION 显式设置时优先生效。
+            // Qwen3-Embedding / F2LLM-v2 官方 query 格式：
+            //   Instruct: {task_description}\nQuery: {query}
+            // 文档侧不加 instruction（OCE embed_documents 不注入）。
+            // EMBED_QUERY_INSTRUCTION / EMBED_INSTRUCTION_TEMPLATE 显式设置时优先生效。
             query_instruction: var("EMBED_QUERY_INSTRUCTION").unwrap_or_else(|| {
-                let model = var("EMBED_MODEL").unwrap_or_default();
-                if model.contains("Qwen3-Embedding") {
+                if needs_instruct {
                     "Given a code retrieval query, retrieve the most relevant code snippets or files that directly implement, explain, or help answer the query.".to_string()
                 } else {
                     String::new()
                 }
             }),
+            instruction_template: var("EMBED_INSTRUCTION_TEMPLATE").unwrap_or_else(|| {
+                if needs_instruct {
+                    "instruct_query".to_string()
+                } else {
+                    "none".to_string()
+                }
+            }),
             provider: var("EMBED_PROVIDER").unwrap_or_else(|| "auto".into()),
             static_model: var("EMBED_STATIC_MODEL"),
             static_model_dir: var("EMBED_STATIC_MODEL_DIR"),
+            local_model: var("EMBED_LOCAL_MODEL"),
+            local_dtype: var("EMBED_LOCAL_DTYPE"),
         }
     }
 }
@@ -223,6 +254,9 @@ pub struct RetrievalEnvSettings {
     pub query_rewrite_model: String,
     pub query_rewrite_num: usize,
     pub path_index_enabled: bool,
+    /// 规则层文件描述注入 embedding_text + rerank 文档（默认关，A/B 实验
+    /// 开关；开启时模型指纹 etext=v2，旧索引 fail-closed 提示重建）
+    pub file_desc_enabled: bool,
 }
 
 impl RetrievalEnvSettings {
@@ -266,6 +300,22 @@ impl RetrievalEnvSettings {
             "RETRIEVAL_INTENT_CLASSIFICATION_ENABLED",
             inner.intent_classification_enabled,
         );
+        inner.related_symbols_enabled = var_bool(
+            "RETRIEVAL_RELATED_SYMBOLS_ENABLED",
+            inner.related_symbols_enabled,
+        );
+        inner.rerank_cutoff_enabled = var_bool(
+            "RETRIEVAL_RERANK_CUTOFF_ENABLED",
+            inner.rerank_cutoff_enabled,
+        );
+        inner.broad_mode_enabled =
+            var_bool("RETRIEVAL_BROAD_MODE_ENABLED", inner.broad_mode_enabled);
+        inner.meta_dir_penalty_enabled = var_bool(
+            "RETRIEVAL_META_DIR_PENALTY_ENABLED",
+            inner.meta_dir_penalty_enabled,
+        );
+        inner.span_merge_enabled =
+            var_bool("RETRIEVAL_SPAN_MERGE_ENABLED", inner.span_merge_enabled);
         Self {
             inner,
             // 回落链：显式 RETRIEVAL_QUERY_REWRITE_MODEL > LLM_MODEL > 内置默认。
@@ -276,6 +326,7 @@ impl RetrievalEnvSettings {
                 .unwrap_or_else(|| "Qwen/Qwen2.5-7B-Instruct".into()),
             query_rewrite_num: var_parse("RETRIEVAL_QUERY_REWRITE_NUM", 3usize),
             path_index_enabled: var_bool("RETRIEVAL_PATH_INDEX_ENABLED", true),
+            file_desc_enabled: var_bool("RETRIEVAL_FILE_DESC_ENABLED", false),
         }
     }
 }
@@ -362,6 +413,8 @@ pub struct Settings {
     pub worker: WorkerSettings,
     pub log: LogSettings,
     pub monitoring: MonitoringSettings,
+    /// OCE 进程内存硬限制（MB），0=不限。超限时拒绝新嵌入请求并告警。
+    pub memory_limit_mb: usize,
 }
 
 impl Settings {
@@ -379,6 +432,7 @@ impl Settings {
             worker: WorkerSettings::from_env(),
             log: LogSettings::from_env(),
             monitoring: MonitoringSettings::from_env(),
+            memory_limit_mb: var_parse("OCE_MEMORY_LIMIT_MB", 0usize),
         }
     }
 

@@ -9,8 +9,8 @@ use crate::openai::embedder::{OpenAIEmbedder, UsageCallback};
 use crate::openai::llm::OpenAILlmClient;
 use crate::settings::{EmbeddingSettings, LlmSettings, RerankSettings};
 use crate::sqlite::credentials::{RuntimeCredential, SqlCredentialAdminStore};
-use oce_core::error::{OceError, OceResult};
 use async_trait::async_trait;
+use oce_core::error::{OceError, OceResult};
 use oce_core::search::Embedder;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -61,6 +61,7 @@ impl CredentialConfiguredEmbedder {
                     max_input_chars: fb.max_input_chars,
                     input_overlap_chars: fb.input_overlap_chars,
                     max_concurrency: fb.max_concurrency,
+                    single_request: fb.single_request,
                     timeout_seconds: fb.timeout_seconds,
                     proxy: fb.proxy.clone(),
                     credential_id: 0,
@@ -74,14 +75,24 @@ impl CredentialConfiguredEmbedder {
                     api_key: cred.api_key,
                     model: cred.model,
                     dimensions: cred.dimensions.map(|d| d as usize).unwrap_or(fb.dimensions),
-                    max_batch_size: cred.max_batch_size.map(|v| v as usize).unwrap_or(fb.max_batch_size),
-                    max_batch_chars: cred.max_batch_chars.map(|v| v as usize).unwrap_or(fb.max_batch_chars),
-                    max_input_chars: cred.max_input_chars.map(|v| v as usize).unwrap_or(fb.max_input_chars),
+                    max_batch_size: cred
+                        .max_batch_size
+                        .map(|v| v as usize)
+                        .unwrap_or(fb.max_batch_size),
+                    max_batch_chars: cred
+                        .max_batch_chars
+                        .map(|v| v as usize)
+                        .unwrap_or(fb.max_batch_chars),
+                    max_input_chars: cred
+                        .max_input_chars
+                        .map(|v| v as usize)
+                        .unwrap_or(fb.max_input_chars),
                     input_overlap_chars: cred
                         .input_overlap_chars
                         .map(|v| v as usize)
                         .unwrap_or(fb.input_overlap_chars),
                     max_concurrency: fb.max_concurrency,
+                    single_request: fb.single_request,
                     timeout_seconds: cred.timeout_seconds as f64,
                     proxy: fb.proxy.clone(),
                     credential_id: cred.id,
@@ -96,10 +107,7 @@ impl CredentialConfiguredEmbedder {
         Ok(config)
     }
 
-    async fn build_delegate(
-        &self,
-        config: &EmbedRuntimeConfig,
-    ) -> OceResult<Arc<OpenAIEmbedder>> {
+    async fn build_delegate(&self, config: &EmbedRuntimeConfig) -> OceResult<Arc<OpenAIEmbedder>> {
         Ok(Arc::new(
             OpenAIEmbedder::new(
                 &config.endpoint,
@@ -108,14 +116,16 @@ impl CredentialConfiguredEmbedder {
                 config.dimensions,
                 config.max_batch_size,
                 config.max_concurrency,
+                config.single_request,
                 config.max_batch_chars,
                 config.max_input_chars,
                 config.input_overlap_chars,
                 config.timeout_seconds,
                 config.proxy.as_deref(),
-                // query_instruction 只作用于查询侧：始终取 env/settings 层配置
-                // （Qwen3-Embedding 官方支持按场景写指令，此前被硬编码 "" 丢弃）
+                // query_instruction + instruction_template 只作用于查询侧：始终取 env/settings 层配置
+                // （Qwen3-Embedding / F2LLM-v2 官方格式 Instruct: ...\nQuery: ...）
                 self.fallback.query_instruction.as_str(),
+                self.fallback.instruction_template.as_str(),
                 config.credential_id,
                 self.on_usage.clone(),
             )
@@ -160,6 +170,7 @@ struct EmbedRuntimeConfig {
     max_input_chars: usize,
     input_overlap_chars: usize,
     max_concurrency: usize,
+    single_request: bool,
     timeout_seconds: f64,
     proxy: Option<String>,
     credential_id: i64,
@@ -248,9 +259,7 @@ impl CredentialConfiguredLlmClient {
                 // 长上下文 rerank（50 候选 × 3000 字符 ≈ 50k+ token）非流式生成
                 // 可能超过网关默认超时；客户端超时必须大于网关自身超时才能收到
                 // 真实响应而不是连接被切断
-                self.fallback
-                    .timeout_seconds
-                    .max(300.0),
+                self.fallback.timeout_seconds.max(300.0),
                 self.fallback.proxy.as_deref(),
                 tpm,
                 self.on_usage.clone(),
@@ -327,7 +336,9 @@ impl CredentialConfiguredReranker {
                 c.api_key,
                 c.model,
                 c.top_n.map(|v| v as usize).unwrap_or(self.fallback.top_n),
-                c.min_score.map(|v| v as f32).unwrap_or(self.fallback.min_score),
+                c.min_score
+                    .map(|v| v as f32)
+                    .unwrap_or(self.fallback.min_score),
                 c.id,
             ),
             None => {

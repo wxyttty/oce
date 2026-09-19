@@ -2,8 +2,8 @@
 //! 分段（max_input_chars + 重叠）→ 分批（batch_size/chars 预算）→ 有界并发 →
 //! 多段按字符数加权池化 + L2 归一。
 
-use oce_core::error::{OceError, OceResult};
 use async_trait::async_trait;
+use oce_core::error::{OceError, OceResult};
 use oce_core::search::Embedder;
 use reqwest::Client;
 use serde_json::json;
@@ -27,7 +27,16 @@ pub struct OpenAIEmbedder {
     max_input_chars: usize,
     input_overlap_chars: usize,
     max_concurrency: usize,
+    /// llama.cpp 后端专用：批量请求在单 slot 内串行；true 时拆批量
+    /// 为并发单条请求利用服务端多 slot 并行。真 OpenAI 兼容 API 保持 false。
+    single_request: bool,
+    /// 实例级全局并发闸：并发上传时多个 embed_pending 同时调 embed_documents，
+    /// 每请求独立 Semaphore 会叠乘（上传并发 × 嵌入并发）打爆嵌入服务；
+    /// 实例级共享后总并发恒等于 max_concurrency。
+    concurrency_gate: Arc<Semaphore>,
     query_instruction: String,
+    /// "none" = format!("{}{}", instr, text)；"instruct_query" = format!("Instruct: {}\nQuery: {}", instr, text)
+    instruction_template: String,
     credential_id: i64,
     on_usage: Option<UsageCallback>,
 }
@@ -42,12 +51,14 @@ impl OpenAIEmbedder {
         dimensions: usize,
         max_batch_size: usize,
         max_concurrency: usize,
+        single_request: bool,
         max_batch_chars: usize,
         max_input_chars: usize,
         input_overlap_chars: usize,
         timeout_seconds: f64,
         proxy: Option<&str>,
         query_instruction: &str,
+        instruction_template: &str,
         credential_id: i64,
         on_usage: Option<UsageCallback>,
     ) -> Result<Self, String> {
@@ -83,7 +94,10 @@ impl OpenAIEmbedder {
             max_input_chars,
             input_overlap_chars,
             max_concurrency,
+            single_request,
+            concurrency_gate: Arc::new(Semaphore::new(max_concurrency)),
             query_instruction: query_instruction.to_string(),
+            instruction_template: instruction_template.to_string(),
             credential_id,
             on_usage,
         })
@@ -148,7 +162,10 @@ impl OpenAIEmbedder {
     /// 多段池化：按段长加权平均 + L2 归一。
     fn pool_vectors(&self, vectors: &[Vec<f32>], segments: &[String]) -> OceResult<Vec<f32>> {
         if vectors.len() != segments.len() || vectors.is_empty() {
-            return Err(OceError::new("Embedding segment count mismatch", "EmbeddingMismatch"));
+            return Err(OceError::new(
+                "Embedding segment count mismatch",
+                "EmbeddingMismatch",
+            ));
         }
         if vectors.len() == 1 {
             return Ok(vectors[0].clone());
@@ -180,7 +197,42 @@ impl OpenAIEmbedder {
         self.embed_batch_typed(texts, "document").await
     }
 
-    async fn embed_batch_typed(&self, texts: &[String], input_type: &str) -> OceResult<Vec<Vec<f32>>> {
+    /// llama.cpp 后端批量请求在单 slot 内串行处理；single_request 模式下
+    /// 拆批量为并发单条请求，利用服务端 -np 多 slot 并行（实测长文本 7 倍提速）。
+    async fn embed_batch_single(
+        &self,
+        texts: &[String],
+        input_type: &str,
+    ) -> OceResult<Vec<Vec<f32>>> {
+        let semaphore = self.concurrency_gate.clone();
+        let mut futs = Vec::with_capacity(texts.len());
+        for text in texts {
+            let sem = semaphore.clone();
+            futs.push(async move {
+                let Some(permit) = sem.acquire_owned().await.ok() else {
+                    return Err(OceError::new("semaphore closed", "EmbeddingError"));
+                };
+                let result = self.embed_batch_typed(std::slice::from_ref(text), input_type).await;
+                drop(permit);
+                result
+            });
+        }
+        let results = ::futures::future::join_all(futs).await;
+        let mut all = Vec::with_capacity(texts.len());
+        for r in results {
+            all.extend(r?);
+        }
+        Ok(all)
+    }
+
+    async fn embed_batch_typed(
+        &self,
+        texts: &[String],
+        input_type: &str,
+    ) -> OceResult<Vec<Vec<f32>>> {
+        if self.single_request && texts.len() > 1 {
+            return self.embed_batch_single(texts, input_type).await;
+        }
         let mut payload = json!({
             "model": self.model,
             "input": texts,
@@ -211,8 +263,10 @@ impl OpenAIEmbedder {
                 "EmbeddingError",
             ));
         }
-        let data: serde_json::Value =
-            resp.json().await.map_err(|e| OceError::new(e.to_string(), "EmbeddingError"))?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| OceError::new(e.to_string(), "EmbeddingError"))?;
         let mut items: Vec<(usize, Vec<f32>)> = data["data"]
             .as_array()
             .ok_or_else(|| OceError::new("missing data", "EmbeddingError"))?
@@ -242,13 +296,19 @@ impl OpenAIEmbedder {
         if let Some(actual) = vectors.first().map(|v| v.len()) {
             if actual != self.dimensions {
                 return Err(OceError::new(
-                    format!("Embedding response dimension mismatch: API returned {actual}, expected {}", self.dimensions),
+                    format!(
+                        "Embedding response dimension mismatch: API returned {actual}, expected {}",
+                        self.dimensions
+                    ),
                     "EmbeddingError",
                 ));
             }
         }
         if vectors.iter().any(|v| v.len() != self.dimensions) {
-            return Err(OceError::new("Embedding response dimension mismatch", "EmbeddingMismatch"));
+            return Err(OceError::new(
+                "Embedding response dimension mismatch",
+                "EmbeddingMismatch",
+            ));
         }
         if let Some(cb) = &self.on_usage {
             let total = data["usage"]["total_tokens"].as_i64().unwrap_or(0);
@@ -267,34 +327,46 @@ impl Embedder for OpenAIEmbedder {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let segment_groups: Vec<Vec<String>> =
-            texts.iter().map(|t| self.split_input(t)).collect();
+        let segment_groups: Vec<Vec<String>> = texts.iter().map(|t| self.split_input(t)).collect();
         let segments: Vec<String> = segment_groups.iter().flatten().cloned().collect();
         let segment_vectors = {
             let batches = self.make_batches(&segments);
-            let semaphore = Arc::new(Semaphore::new(self.max_concurrency));
-            let mut futs = Vec::with_capacity(batches.len());
-            for batch in batches {
-                let sem = semaphore.clone();
-                futs.push(async move {
-                    // permit 失败与嵌入失败分别报错（此前统一吞成
-                    // "semaphore closed"，上游 API 的真实 4xx 被掩盖）
-                    let Some(permit) = sem.acquire_owned().await.ok() else {
-                        return Err(OceError::new("semaphore closed", "EmbeddingError"));
-                    };
-                    let result = self.embed_batch(&batch).await;
-                    drop(permit);
-                    result
-                });
-            }
-            let results = ::futures::future::join_all(futs).await;
-            let mut all: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
-            for r in results {
-                match r {
-                    Ok(v) => all.extend(v),
-                    Err(e) => return Err(e),
+            // single_request 模式：批级 permit 会让 embed_batch_single 内的
+            // 单条 permit 嵌套等待同一信号量而死锁；此模式并发完全由
+            // 单条层控制，批级直接串行调用。
+            let all: Vec<Vec<f32>> = if self.single_request {
+                let mut all = Vec::with_capacity(segments.len());
+                for batch in &batches {
+                    all.extend(self.embed_batch(batch).await?);
                 }
-            }
+                all
+            } else {
+                // 实例级闸：并发上传时多个请求共享同一并发预算，不叠乘
+                let semaphore = self.concurrency_gate.clone();
+                let mut futs = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    let sem = semaphore.clone();
+                    futs.push(async move {
+                        // permit 失败与嵌入失败分别报错（此前统一吞成
+                        // "semaphore closed"，上游 API 的真实 4xx 被掩盖）
+                        let Some(permit) = sem.acquire_owned().await.ok() else {
+                            return Err(OceError::new("semaphore closed", "EmbeddingError"));
+                        };
+                        let result = self.embed_batch(&batch).await;
+                        drop(permit);
+                        result
+                    });
+                }
+                let results = ::futures::future::join_all(futs).await;
+                let mut all: Vec<Vec<f32>> = Vec::with_capacity(segments.len());
+                for r in results {
+                    match r {
+                        Ok(v) => all.extend(v),
+                        Err(e) => return Err(e),
+                    }
+                }
+                all
+            };
             all
         };
 
@@ -310,14 +382,20 @@ impl Embedder for OpenAIEmbedder {
 
     async fn embed_query(&self, text: &str) -> OceResult<Vec<f32>> {
         if self.is_voyage {
-            return self.embed_batch_typed(&[text.to_string()], "query").await.map(|v| v.into_iter().next().unwrap());
+            return self
+                .embed_batch_typed(&[text.to_string()], "query")
+                .await
+                .map(|v| v.into_iter().next().unwrap());
         }
         let text = if self.query_instruction.is_empty() {
             text.to_string()
+        } else if self.instruction_template == "instruct_query" {
+            format!("Instruct: {}\nQuery: {}", self.query_instruction, text)
         } else {
             format!("{}{}", self.query_instruction, text)
         };
         let mut out = self.embed_documents(vec![text]).await?;
-        out.pop().ok_or_else(|| OceError::new("empty embedding response", "EmbeddingError"))
+        out.pop()
+            .ok_or_else(|| OceError::new("empty embedding response", "EmbeddingError"))
     }
 }
