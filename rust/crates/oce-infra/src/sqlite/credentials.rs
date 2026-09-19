@@ -81,7 +81,14 @@ fn sql_err(e: rusqlite::Error) -> OceError {
 
 fn row_to_record(row: &rusqlite::Row) -> Result<CredentialRecord, rusqlite::Error> {
     let api_key: String = row.get(23)?;
-    let last4: String = api_key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let last4: String = api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     Ok(CredentialRecord {
         id: row.get(0)?,
         kind: row.get(1)?,
@@ -281,7 +288,10 @@ impl SqlCredentialAdminStore {
         let db = self.db.clone();
         crate::run_sql_oce(db, move |conn| {
             let n = conn
-                .execute("DELETE FROM model_credentials WHERE id = ?1", [credential_id])
+                .execute(
+                    "DELETE FROM model_credentials WHERE id = ?1",
+                    [credential_id],
+                )
                 .map_err(sql_err)?;
             Ok(n > 0)
         })

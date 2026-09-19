@@ -5,11 +5,7 @@ use oce_infra::settings::TriviumSettings;
 use oce_infra::trivium::TriviumStore;
 
 fn temp_tdb(tag: &str) -> TriviumSettings {
-    let dir = std::env::temp_dir().join(format!(
-        "oce-trivium-test-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("oce-trivium-test-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     TriviumSettings {
@@ -19,13 +15,21 @@ fn temp_tdb(tag: &str) -> TriviumSettings {
         dense_dim: 8,
         auto_build_quiver: false,
         text_hybrid: false,
-                    expand_depth: 0,
+                text_boost: 0.8,
+        expand_depth: 0,
     }
 }
 
 fn fake_vector(seed: u64, dim: usize) -> Vec<f32> {
     (0..dim)
-        .map(|i| ((seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64 * 1442695040888963407)) >> 33) as f32 / u32::MAX as f32 - 0.5)
+        .map(|i| {
+            ((seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(i as u64 * 1442695040888963407))
+                >> 33) as f32
+                / u32::MAX as f32
+                - 0.5
+        })
         .collect()
 }
 
@@ -122,15 +126,26 @@ async fn path_index_roundtrip() {
         .unwrap();
 
     let results = store
-        .search_paths("query", &fake_vector(10, 8), Some(&["blob-a".to_string()]), 20)
+        .search_paths(
+            "query",
+            &fake_vector(10, 8),
+            Some(&["blob-a".to_string()]),
+            20,
+        )
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].blob_name, "blob-a");
     assert!(results[0].score > 0.9);
 
-    store.delete_by_blob_names(&["blob-a".to_string()]).await.unwrap();
-    let rest = store.search_paths("query", &fake_vector(10, 8), None, 20).await.unwrap();
+    store
+        .delete_by_blob_names(&["blob-a".to_string()])
+        .await
+        .unwrap();
+    let rest = store
+        .search_paths("query", &fake_vector(10, 8), None, 20)
+        .await
+        .unwrap();
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].path, "docs/guide.md");
 }

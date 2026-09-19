@@ -7,16 +7,15 @@ use oce_core::indexing::{EmbeddingGate, IndexingPipeline};
 use oce_core::retrieval::RetrievalPipeline;
 use oce_core::retrieval_settings::RetrievalSettings;
 use oce_core::search::{
-    IntentClassifier, LlmReranker, PathSearchStore, QueryRewriter, Reranker,
-    SearchHit, SearchStore,
+    IntentClassifier, LlmReranker, PathSearchStore, QueryRewriter, Reranker, SearchHit, SearchStore,
 };
 use oce_infra::credentials::CredentialConfiguredReranker;
 use oce_infra::settings::Settings;
-use oce_infra::static_embed::StaticEmbedder;
 use oce_infra::sqlite::chains::SqlChainRepository;
-use oce_infra::sqlite::credentials::{SqlCredentialAdminStore, RuntimeCredential};
+use oce_infra::sqlite::credentials::{RuntimeCredential, SqlCredentialAdminStore};
 use oce_infra::sqlite::metrics::SqlMetricsSink;
 use oce_infra::sqlite::repos::SqlBlobRepository;
+use oce_infra::static_embed::StaticEmbedder;
 use std::sync::Arc;
 
 /// 嵌入开关（EMBED_ENABLED 的运行时快照）。
@@ -38,13 +37,22 @@ struct ApiRerankAdapter {
     runtime: Arc<CredentialConfiguredReranker>,
     top_n: usize,
     max_doc_chars: usize,
+    /// 规则层文件描述注入 rerank 文档（与 embedding_text 同源，RETRIEVAL_FILE_DESC_ENABLED）
+    file_desc_enabled: bool,
 }
 
 #[async_trait::async_trait]
 impl Reranker for ApiRerankAdapter {
-    async fn rerank(&self, query: &str, hits: Vec<SearchHit>) -> oce_core::error::OceResult<Vec<SearchHit>> {
+    async fn rerank(
+        &self,
+        query: &str,
+        hits: Vec<SearchHit>,
+    ) -> oce_core::error::OceResult<oce_core::search::RerankOutcome> {
         if hits.is_empty() {
-            return Ok(hits);
+            return Ok(oce_core::search::RerankOutcome {
+                ranked: vec![],
+                unscored: hits,
+            });
         }
         // 候选窗口与 LLM 重排对齐：rerank 是逐篇精排，窗口过浅会截断融合结果
         let window = hits.len().min(self.top_n.max(1));
@@ -53,16 +61,27 @@ impl Reranker for ApiRerankAdapter {
             .iter()
             .map(|hit| {
                 let body: String = hit.content.chars().take(self.max_doc_chars).collect();
-                format!(
-                    "File: {}\nLines: {}-{}\n\n{}",
-                    hit.path, hit.start_line, hit.end_line, body
-                )
+                // 描述注入与索引侧 embedding_text 同源：reranker 与嵌入器看到同一
+                // 份桥接句，清单/配置文件才能在「配置文件在哪里」类查询上得分
+                let desc = if self.file_desc_enabled {
+                    oce_core::file_desc::file_description(&hit.path, "")
+                } else {
+                    String::new()
+                };
+                if desc.is_empty() {
+                    format!(
+                        "File: {}\nLines: {}-{}\n\n{}",
+                        hit.path, hit.start_line, hit.end_line, body
+                    )
+                } else {
+                    format!(
+                        "File: {}\n{}\nLines: {}-{}\n\n{}",
+                        hit.path, desc, hit.start_line, hit.end_line, body
+                    )
+                }
             })
             .collect();
-        let results = self
-            .runtime
-            .rerank(query, &documents, None)
-            .await?;
+        let results = self.runtime.rerank(query, &documents, None).await?;
         let mut ranked: Vec<SearchHit> = Vec::with_capacity(results.len());
         let mut leftover: Vec<SearchHit> = candidates;
         for (index, score) in results {
@@ -71,16 +90,21 @@ impl Reranker for ApiRerankAdapter {
                 ranked.push(hit);
             }
         }
-        // 未被端点返回的候选按原序补齐，保证 rerank 不减少结果数（select 层依赖完整候选）
-        let ranked_keys: std::collections::HashSet<_> =
-            ranked.iter().map(oce_core::search::search_hit_key).collect();
+        // 未被端点返回的候选按原序补齐，保证 rerank 不减少结果数（select 层依赖完整候选）。
+        // 打分/未打分分离（RerankOutcome）：悬崖截断只对端点校准分生效，
+        // 未打分候选的融合分不参与判定
+        let ranked_keys: std::collections::HashSet<_> = ranked
+            .iter()
+            .map(oce_core::search::search_hit_key)
+            .collect();
+        let mut unscored: Vec<SearchHit> = Vec::new();
         for hit in leftover.drain(..) {
             let key = oce_core::search::search_hit_key(&hit);
             if !ranked_keys.contains(&key) {
-                ranked.push(hit);
+                unscored.push(hit);
             }
         }
-        Ok(ranked)
+        Ok(oce_core::search::RerankOutcome { ranked, unscored })
     }
 }
 
@@ -91,6 +115,8 @@ pub struct LlmRerankerImpl {
     max_candidates: usize,
     output_top_k: usize,
     snippet_chars: usize,
+    /// 规则层文件描述注入候选描述行（与 embedding_text 同源）
+    file_desc_enabled: bool,
 }
 
 /// LLM rerank / rewrite / intent 的 prompt —— 从 Python prompts.py 逐字移植（AST 提取），
@@ -215,11 +241,20 @@ const INTENT_USER_TEMPLATE: &str = r##"
 Query: {query}
 Label:"##;
 
-
 /// prompt 回显拦截（小参数模型会把指令原样回显）。
 const PROMPT_ECHO_MARKERS: [&str; 12] = [
-    "改写策略", "用户查询", "改写后的查询", "搜索关键词", "召回率", "每行一个",
-    "不要编号", "文件名版本", "英文关键词版本", "功能描述版本", "查询改写助手", "要求:",
+    "改写策略",
+    "用户查询",
+    "改写后的查询",
+    "搜索关键词",
+    "召回率",
+    "每行一个",
+    "不要编号",
+    "文件名版本",
+    "英文关键词版本",
+    "功能描述版本",
+    "查询改写助手",
+    "要求:",
 ];
 const MAX_REWRITE_CHARS: usize = 80;
 
@@ -250,13 +285,31 @@ impl LlmReranker for LlmRerankerImpl {
                 snippet.push_str("\n…");
             }
             snippet = snippet.replace("</candidate", "<\\/candidate");
-            let open_tag = format!(
-                "<candidate id=\"{}\" path=\"{}\" lines=\"{}-{}\">",
-                i + 1,
-                path,
-                hit.start_line,
-                hit.end_line
-            );
+            // 描述行与索引侧 embedding_text 同源：LLM 重排对清单/配置文件的
+            // 判定依据与召回阶段一致（BCE rerank 文档同款注入）
+            let desc = if self.file_desc_enabled {
+                oce_core::file_desc::file_description(&hit.path, "")
+            } else {
+                String::new()
+            };
+            let open_tag = if desc.is_empty() {
+                format!(
+                    "<candidate id=\"{}\" path=\"{}\" lines=\"{}-{}\">",
+                    i + 1,
+                    path,
+                    hit.start_line,
+                    hit.end_line
+                )
+            } else {
+                format!(
+                    "<candidate id=\"{}\" path=\"{}\" lines=\"{}-{}\" description=\"{}\">",
+                    i + 1,
+                    path,
+                    hit.start_line,
+                    hit.end_line,
+                    desc.replace('"', "&quot;")
+                )
+            };
             if snippet.is_empty() {
                 parts.push(format!("{open_tag}</candidate>"));
             } else {
@@ -265,15 +318,23 @@ impl LlmReranker for LlmRerankerImpl {
         }
         let user = RERANK_USER_TEMPLATE
             .replace("{query}", query)
-            .replace("{count}", &candidates.len().min(self.max_candidates).to_string())
+            .replace(
+                "{count}",
+                &candidates.len().min(self.max_candidates).to_string(),
+            )
             .replace("{candidates}", &parts.join("\n"))
             .replace("{top_k}", &self.output_top_k.to_string());
         let messages = vec![
             serde_json::json!({"role": "system", "content": RERANK_SYSTEM_PROMPT}),
             serde_json::json!({"role": "user", "content": user}),
         ];
-        // Python 同款温度 0.1
-        let response = self.client.chat(&messages, &self.model, 0.1, None).await?;
+        // Python 同款温度 0.1；输出上限：编号列表 ≤ 10 行 ≈ 60 token，
+        // 512 留足余量。思考模型未关思考时（端点忽略 enable_thinking）
+        // max_tokens 是第二道闸——思考烧到上限就停，不会无限生成几分钟
+        let response = self
+            .client
+            .chat(&messages, &self.model, 0.1, Some(512))
+            .await?;
         // 解析：每行取首个整数（容忍 "1." / "- 1" / "[1] path" 变体），去重 + 越界丢弃
         let mut order: Vec<usize> = Vec::new();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -286,7 +347,9 @@ impl LlmReranker for LlmRerankerImpl {
                     break;
                 }
             }
-            let Ok(idx) = num.parse::<usize>() else { continue };
+            let Ok(idx) = num.parse::<usize>() else {
+                continue;
+            };
             if idx >= 1 && idx <= self.max_candidates {
                 let index = idx - 1;
                 if index < candidates.len() && seen.insert(index) {
@@ -303,7 +366,10 @@ impl LlmReranker for LlmRerankerImpl {
                     break;
                 }
                 let key = oce_core::search::search_hit_key(hit);
-                if !ranked.iter().any(|r| oce_core::search::search_hit_key(r) == key) {
+                if !ranked
+                    .iter()
+                    .any(|r| oce_core::search::search_hit_key(r) == key)
+                {
                     ranked.push(hit.clone());
                 }
             }
@@ -331,13 +397,18 @@ impl QueryRewriter for QueryRewriterImpl {
             .replace("{num_rewrites}", &self.num_rewrites.to_string())
             .replace("{query}", query);
         let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
-        let response = self.client.chat(&messages, &self.model, 0.2, None).await?;
+        // 输出上限：3 行短变体 ≈ 150 token；思考模型场景与 rerank 同理
+        let response = self
+            .client
+            .chat(&messages, &self.model, 0.2, Some(512))
+            .await?;
         let mut rewritten: Vec<String> = Vec::new();
         for line in response.lines() {
             let mut cleaned = line.trim();
             // 去编号/markdown 前缀
-            cleaned = cleaned
-                .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '*' | '•' | ' ' | '\t'));
+            cleaned = cleaned.trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, '.' | '-' | '*' | '•' | ' ' | '\t')
+            });
             if cleaned.len() > MAX_REWRITE_CHARS
                 || cleaned.chars().count() < 3
                 || PROMPT_ECHO_MARKERS.iter().any(|m| cleaned.contains(m))
@@ -374,7 +445,10 @@ impl IntentClassifier for IntentClassifierImpl {
             serde_json::json!({"role": "system", "content": INTENT_SYSTEM_PROMPT}),
             serde_json::json!({"role": "user", "content": user}),
         ];
-        let response = self.client.chat(&messages, &self.model, 0.0, Some(2)).await?;
+        let response = self
+            .client
+            .chat(&messages, &self.model, 0.0, Some(2))
+            .await?;
         Ok(oce_core::strategy::LlmIntent::from_label(response.trim()))
     }
 }
@@ -411,6 +485,9 @@ impl Container {
         settings: Settings,
         embedder_override: Option<Arc<dyn oce_core::search::Embedder>>,
     ) -> Result<Arc<Self>, String> {
+        // 内存硬限制初始化（OCE_MEMORY_LIMIT_MB）
+        oce_infra::memory_guard::init(settings.memory_limit_mb);
+
         if settings.database.sqlite_path().is_none() {
             return Err("Rust 版第一阶段仅支持 SQLite 个人模式（DB_URL 需以 sqlite 开头）".into());
         }
@@ -440,18 +517,32 @@ impl Container {
             let _ = std::fs::create_dir_all(parent);
         }
         // 嵌入模型指纹 sidecar：同维度不同模型的向量混入同一索引会静默污染检索，
-        // 换模型必须重建索引（fail-closed 提示，不做静默兼容）
+        // 换模型必须重建索引（fail-closed 提示，不做静默兼容）。etext=v2 标记
+        // embedding_text 格式（含规则层文件描述注入）——开启 file_desc 后旧向量
+        // 与新文本语义不同，与换模型同语义：强制重建。
         let sidecar_path = format!("{}.model", tdb_settings.path);
         let tdb_path_display = tdb_settings.path.clone();
-        let model_fingerprint = format!("{model_tag} dim={vector_dim}");
+        // etext 版本化 embedding_text 格式（v2 = 含规则层文件描述注入）。
+        // 条件式迁移：关闭态写 v1 且兼容旧格式 sidecar（无 etext 后缀，语义同为
+        // 无描述注入）——否则默认关闭的实验开关会强迫全部用户零语义变化重嵌；
+        // 开启态写 v2，旧格式/v1 一律 fail-closed（与换模型同语义）。
+        let etext_version: &str = if settings.retrieval.file_desc_enabled {
+            "etext=v2"
+        } else {
+            "etext=v1"
+        };
+        let model_fingerprint = format!("{model_tag} dim={vector_dim} {etext_version}");
+        let legacy_no_etext = format!("{model_tag} dim={vector_dim}");
         let tdb_exists = std::path::Path::new(&tdb_settings.path).exists();
         if tdb_exists {
             match std::fs::read_to_string(&sidecar_path) {
                 Ok(recorded) => {
                     let recorded = recorded.trim();
-                    if !recorded.is_empty() && recorded != model_fingerprint {
+                    let compatible = recorded == model_fingerprint
+                        || (etext_version == "etext=v1" && recorded == legacy_no_etext);
+                    if !recorded.is_empty() && !compatible {
                         return Err(format!(
-                            "既有索引的嵌入模型与当前配置不符：\n  索引由 [{recorded}] 构建\n  当前配置 [{model_fingerprint}]\n                             请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传，以重建索引。"
+                            "既有索引的嵌入配置与当前配置不符：\n  索引由 [{recorded}] 构建\n  当前配置 [{model_fingerprint}]\n                             请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传，以重建索引。"
                         ));
                     }
                 }
@@ -478,7 +569,8 @@ impl Container {
         // ── 监控（旁路，非阻塞） ──
         let metrics = if settings.monitoring.enabled {
             let sink = Arc::new(SqlMetricsSink::new(db.clone()));
-            sink.clone().spawn_flush_task(settings.monitoring.flush_interval_seconds);
+            sink.clone()
+                .spawn_flush_task(settings.monitoring.flush_interval_seconds);
             sink.clone().spawn_cleanup_task(
                 settings.monitoring.retention_days,
                 settings.monitoring.cleanup_interval_seconds,
@@ -501,28 +593,32 @@ impl Container {
             settings.monitoring.resource_sample_interval_seconds,
             data_dir.clone(),
         );
-        let on_usage: Option<oce_infra::openai::embedder::UsageCallback> = metrics
-            .as_ref()
-            .map(|m| {
+        let on_usage: Option<oce_infra::openai::embedder::UsageCallback> =
+            metrics.as_ref().map(|m| {
                 let m = m.clone() as Arc<dyn oce_core::metrics::MetricsSink>;
-                Arc::new(move |credential_id: i64, kind: &str, model: &str, prompt: i64, completion: i64| {
-                    m.record_token_usage(oce_core::metrics::TokenUsageRecord {
-                        kind: kind.to_string(),
-                        model: model.to_string(),
-                        credential_id,
-                        prompt_tokens: prompt.max(0) as u64,
-                        completion_tokens: completion.max(0) as u64,
-                        total_tokens: (prompt.max(0) + completion.max(0)) as u64,
-                    });
-                }) as oce_infra::openai::embedder::UsageCallback
+                Arc::new(
+                    move |credential_id: i64,
+                          kind: &str,
+                          model: &str,
+                          prompt: i64,
+                          completion: i64| {
+                        m.record_token_usage(oce_core::metrics::TokenUsageRecord {
+                            kind: kind.to_string(),
+                            model: model.to_string(),
+                            credential_id,
+                            prompt_tokens: prompt.max(0) as u64,
+                            completion_tokens: completion.max(0) as u64,
+                            total_tokens: (prompt.max(0) + completion.max(0)) as u64,
+                        });
+                    },
+                ) as oce_infra::openai::embedder::UsageCallback
             });
 
         let embedder_runtime = embed_runtime;
 
         // ── 切块器 ──
-        let chunker: Box<dyn Chunker> = Box::new(
-            oce_core::chunk::build_chunker().map_err(|e| format!("build chunker: {e}"))?,
-        );
+        let chunker: Box<dyn Chunker> =
+            Box::new(oce_core::chunk::build_chunker().map_err(|e| format!("build chunker: {e}"))?);
 
         // ── 索引管线 ──
         let gate = Arc::new(EmbeddingGateImpl {
@@ -535,30 +631,38 @@ impl Container {
             } else {
                 None
             };
-        let indexing = Arc::new(IndexingPipeline::new(
-            chunker,
-            embedder.clone(),
-            vector_index,
-            blob_repo.clone(),
-            path_store_for_index,
-            gate,
-        ));
+        let indexing = Arc::new(IndexingPipeline {
+            file_desc_enabled: settings.retrieval.file_desc_enabled,
+            ..IndexingPipeline::new(
+                chunker,
+                embedder.clone(),
+                vector_index,
+                blob_repo.clone(),
+                path_store_for_index,
+                gate,
+            )
+        });
 
         // ── 检索管线 ──
         let retrieval_settings: RetrievalSettings = settings.retrieval.inner.clone();
         let search_store: Arc<dyn SearchStore> = trivium.clone();
-        let mut pipeline = RetrievalPipeline::new(
-            embedder.clone(),
-            search_store,
-            retrieval_settings.clone(),
-        )
-        .with_first_chunk_lookup(Arc::new(oce_infra::sqlite::chains::SqlFirstChunkLookup {
-            db: db.clone(),
-        }));
+        let mut pipeline =
+            RetrievalPipeline::new(embedder.clone(), search_store, retrieval_settings.clone())
+                .with_first_chunk_lookup(Arc::new(
+                    oce_infra::sqlite::chains::SqlFirstChunkLookup { db: db.clone() },
+                ));
         pipeline.exact_store = Some(Arc::new(oce_infra::sqlite::chains::SqlExactStore {
             db: db.clone(),
             max_scope_blobs: retrieval_settings.exact_max_scope_blobs,
         }));
+        if retrieval_settings.span_merge_enabled {
+            pipeline.file_content_lookup =
+                Some(Arc::new(oce_infra::sqlite::chains::SqlFileContentLookup {
+                    db: db.clone(),
+                }));
+        }
+        pipeline.related_symbols_enabled = retrieval_settings.related_symbols_enabled;
+        pipeline.broad_mode_enabled = retrieval_settings.broad_mode_enabled;
         if settings.retrieval.path_index_enabled {
             let ps: Arc<dyn PathSearchStore> = trivium.clone();
             pipeline.path_store = Some(ps);
@@ -588,6 +692,7 @@ impl Container {
                     // 与 LLM 重排 snippet_chars 同量级：候选窗口 50 × 1600 字符在
                     // llama-server CPU 上单次约 20s；更长正文收益递减且延迟线性上涨
                     max_doc_chars: 1_600,
+                    file_desc_enabled: settings.retrieval.file_desc_enabled,
                     runtime: runtime.clone(),
                 });
                 rerank_api = Some(runtime);
@@ -645,8 +750,11 @@ impl Container {
                     max_candidates: settings.llm.max_candidates,
                     output_top_k: settings.llm.output_top_k,
                     snippet_chars: settings.llm.snippet_chars,
+                    file_desc_enabled: settings.retrieval.file_desc_enabled,
                 }));
-                pipeline.llm_reranker = llm_reranker.clone().map(|r| Arc::clone(&r) as Arc<dyn LlmReranker>);
+                pipeline.llm_reranker = llm_reranker
+                    .clone()
+                    .map(|r| Arc::clone(&r) as Arc<dyn LlmReranker>);
             }
             if settings.retrieval.inner.query_rewrite_enabled {
                 let client = make_client(
@@ -707,7 +815,6 @@ impl Container {
 /// resolve_active 返回类型的便捷 re-export（server 层使用）。
 pub type ResolvedCredential = RuntimeCredential;
 
-
 /// 向量化提供方解析：auto（有 key/凭据→openai，否则 static）| static | openai。
 /// 返回 (嵌入器, 向量维度, reload 运行时, 提供方名)。
 async fn resolve_embed_provider(
@@ -734,14 +841,21 @@ async fn resolve_embed_provider(
 
     if let Some(e) = embedder_override {
         // 测试/bench 注入：维度沿用配置（容器校验交给既有逻辑）
-        return Ok((e, settings.trivium.dense_dim, runtime, "override", "override".into()));
+        return Ok((
+            e,
+            settings.trivium.dense_dim,
+            runtime,
+            "override",
+            "override".into(),
+        ));
     }
 
     let provider = match settings.embedding.provider.as_str() {
         "static" => "static",
         "openai" => "openai",
+        "local" => "local",
         _ => {
-            // auto：有 API key 或 DB 凭据 → openai，否则 static
+            // auto：有 API key 或 DB 凭据 → openai；有 local_model → local；否则 static
             let has_key = settings.embedding.api_key.is_some()
                 || credential_store
                     .resolve_active("embed")
@@ -750,6 +864,8 @@ async fn resolve_embed_provider(
                     .is_some();
             if has_key {
                 "openai"
+            } else if settings.embedding.local_model.is_some() {
+                "local"
             } else {
                 "static"
             }
@@ -763,6 +879,29 @@ async fn resolve_embed_provider(
             let model_id = se.model_id().to_string();
             tracing::info!("embed provider: static (model={model_id}, dim={dim})");
             Ok((Arc::new(se), dim, runtime, "static", model_id))
+        }
+        "local" => {
+            let model_id = settings
+                .embedding
+                .local_model
+                .clone()
+                .unwrap_or_else(|| "Qwen/Qwen3-Embedding-0.6B".into());
+            let dtype = settings
+                .embedding
+                .local_dtype
+                .clone()
+                .unwrap_or_else(|| "f32".into());
+            let ce = oce_infra::candle_embed::CandleEmbedder::new(
+                &model_id,
+                &dtype,
+                settings.embedding.dimensions,
+                &settings.embedding.query_instruction,
+                &settings.embedding.instruction_template,
+            )
+            .map_err(|e| format!("candle embed init: {e}"))?;
+            let dim = settings.embedding.dimensions;
+            tracing::info!("embed provider: local (model={model_id}, dtype={dtype}, dim={dim})");
+            Ok((Arc::new(ce), dim, runtime, "local", format!("local:{model_id}:{dtype}")))
         }
         _ => {
             if settings.embedding.dimensions != settings.trivium.dense_dim {
@@ -778,7 +917,10 @@ async fn resolve_embed_provider(
                 settings.trivium.dense_dim,
                 runtime,
                 "openai",
-                format!("openai:{}:{}", settings.embedding.model, settings.embedding.dimensions),
+                format!(
+                    "openai:{}:{}",
+                    settings.embedding.model, settings.embedding.dimensions
+                ),
             ))
         }
     }

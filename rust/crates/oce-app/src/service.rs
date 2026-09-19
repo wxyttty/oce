@@ -3,14 +3,14 @@
 
 use oce_core::blob::Blob;
 use oce_core::chain::Chain;
-use rusqlite;
 use oce_core::error::{OceError, OceResult};
-use oce_core::formatter::format_retrieval;
+use oce_core::formatter::format_retrieval_with_notes;
 use oce_core::indexing::{BlobRepository, IndexingPipeline};
-use oce_core::retrieval::RetrievalPipeline;
-use oce_core::search::{search_hit_key, VectorIndex, SearchHit, RetrievalAudit};
 use oce_core::metrics::{MetricsSink, RetrievalMetricRecord};
+use oce_core::retrieval::RetrievalPipeline;
+use oce_core::search::{search_hit_key, RetrievalAudit, SearchHit, VectorIndex};
 use oce_infra::sqlite::chains::classify_blob_status;
+use rusqlite;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,7 +87,10 @@ impl RetrievalApplication {
     }
 
     /// find-missing：未知（未上传）与已上传未索引（非 ready）分类。
-    pub async fn find_missing(&self, blob_names: Vec<String>) -> OceResult<(Vec<String>, Vec<String>)> {
+    pub async fn find_missing(
+        &self,
+        blob_names: Vec<String>,
+    ) -> OceResult<(Vec<String>, Vec<String>)> {
         classify_blob_status(&self.blob_repo, blob_names).await
     }
 
@@ -101,7 +104,9 @@ impl RetrievalApplication {
         let mut names = Vec::with_capacity(blobs.len());
         for blob in &blobs {
             let blob_name = compute_blob_name(&blob.path, &blob.content);
-            self.indexing.ingest(&blob_name, &blob.path, &blob.content).await?;
+            self.indexing
+                .ingest(&blob_name, &blob.path, &blob.content)
+                .await?;
             names.push(blob_name);
         }
         let embedded_count = self.indexing.embed_pending(Some(&names), true).await?;
@@ -143,12 +148,8 @@ impl RetrievalApplication {
         // 检索审计旁路落库（monitoring/audit 关闭时为 None，零开销跳过）
         if let Some(metrics) = &self.metrics {
             if self.retrieval_audit_enabled {
-                let mut record = RetrievalMetricRecord::from_audit(
-                    &audit,
-                    "retrieval",
-                    hits.len(),
-                    elapsed_ms,
-                );
+                let mut record =
+                    RetrievalMetricRecord::from_audit(&audit, "retrieval", hits.len(), elapsed_ms);
                 if self.store_query_text {
                     record.query_text = Some(information_request.to_string());
                 }
@@ -156,7 +157,17 @@ impl RetrievalApplication {
             }
         }
 
-        let formatted = format_retrieval(&hits);
+        // related symbols hints：非空时用完整拼装（sections + <related_symbols> 块）
+        let notes = oce_core::formatter::RetrievalNotes {
+            weak: audit.weak_match,
+            degraded: audit.semantic_degraded,
+            broad: audit.broad,
+        };
+        let formatted = if audit.related_symbols.is_empty() {
+            format_retrieval_with_notes(&hits, &notes)
+        } else {
+            oce_core::formatter::format_retrieval_full(&hits, &notes, &audit.related_symbols)
+        };
         Ok(RetrievalResult {
             hits,
             formatted_retrieval: formatted,
@@ -182,7 +193,9 @@ impl RetrievalApplication {
             };
             let chain = self.chain_repo.get(&chain_id).await?;
             let Some(chain) = chain else {
-                return Err(OceError::needs_reset("checkpoint 链不存在（服务端状态丢失）"));
+                return Err(OceError::needs_reset(
+                    "checkpoint 链不存在（服务端状态丢失）",
+                ));
             };
             base.extend(chain.members.into_iter());
         } else if added.is_empty() {
@@ -231,7 +244,9 @@ impl RetrievalApplication {
                     .apply_checkpoint(&chain_id, added.to_vec(), deleted.to_vec())
                     .await?;
                 let Some(version) = version else {
-                    return Err(OceError::needs_reset("checkpoint 链不存在（服务端状态丢失）"));
+                    return Err(OceError::needs_reset(
+                        "checkpoint 链不存在（服务端状态丢失）",
+                    ));
                 };
                 self.chain_repo.touch_members(&chain_id).await?;
                 Ok(CheckpointResult {
@@ -256,7 +271,9 @@ impl RetrievalApplication {
             .apply_checkpoint(&chain_id, added.to_vec(), deleted.to_vec())
             .await?;
         if version.is_none() {
-            return Err(OceError::needs_reset("checkpoint 链不存在（服务端状态丢失）"));
+            return Err(OceError::needs_reset(
+                "checkpoint 链不存在（服务端状态丢失）",
+            ));
         }
         Ok(())
     }
@@ -267,8 +284,7 @@ impl RetrievalApplication {
         blob_names: Vec<String>,
         checkpoint_id: Option<&str>,
     ) -> OceResult<(Vec<String>, Vec<String>, bool)> {
-        let (unknown, nonindexed) =
-            classify_blob_status(&self.blob_repo, blob_names).await?;
+        let (unknown, nonindexed) = classify_blob_status(&self.blob_repo, blob_names).await?;
         let mut checkpoint_not_found = false;
         if let Some(cid) = checkpoint_id.filter(|s| !s.is_empty()) {
             if let Some((chain_id, _)) = Chain::parse_checkpoint_token(cid) {
@@ -281,12 +297,7 @@ impl RetrievalApplication {
     }
 
     /// GC：过期链删除 + 过期 blob 删除（dry_run 只统计）。
-    pub async fn run_gc(
-        &self,
-        ttl_days: u32,
-        dry_run: bool,
-        limit: usize,
-    ) -> OceResult<GcResult> {
+    pub async fn run_gc(&self, ttl_days: u32, dry_run: bool, limit: usize) -> OceResult<GcResult> {
         let expired_chains = self.chain_repo.find_expired(ttl_days).await?;
         let expired_blobs = self.blob_repo.find_expired(ttl_days, limit).await?;
         if dry_run {
@@ -328,13 +339,16 @@ impl RetrievalApplication {
 
     /// 查有 staging 但长时间未处理的 pending blob（requeue-stale 用）。
     /// 返回数量；个人模式仅统计，不重复入队（无独立队列）。
-    pub async fn find_stale_with_staging(&self, stale_hours: i64, limit: usize) -> OceResult<usize> {
+    pub async fn find_stale_with_staging(
+        &self,
+        stale_hours: i64,
+        limit: usize,
+    ) -> OceResult<usize> {
         let db = self.blob_repo.db.clone();
         let result = tokio::task::spawn_blocking(move || {
             db.with_conn(|conn| {
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::hours(stale_hours))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(stale_hours))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 let mut stmt = conn
                     .prepare(
                         "SELECT b.blob_name FROM blobs b
@@ -343,7 +357,9 @@ impl RetrievalApplication {
                     )
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(rusqlite::params![cutoff, limit as i64], |r| r.get::<_, String>(0))
+                    .query_map(rusqlite::params![cutoff, limit as i64], |r| {
+                        r.get::<_, String>(0)
+                    })
                     .map_err(|e| e.to_string())?;
                 Ok(rows.filter_map(|r| r.ok()).count())
             })

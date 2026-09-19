@@ -29,14 +29,16 @@ impl InProcessQueue {
 
     pub fn enqueue(&self, blob_name: &str) {
         if self.tx.send(blob_name.to_string()).is_ok() {
-            self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.queued
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     async fn dequeue(&self) -> Option<String> {
         let name = self.rx.lock().await.recv().await;
         if name.is_some() {
-            self.queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         name
     }
@@ -128,11 +130,18 @@ async fn worker_loop(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         };
-        queue.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let result = indexing.embed_pending(Some(&[blob_name.clone()]), false).await;
+        queue
+            .inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = indexing
+            .embed_pending(Some(&[blob_name.clone()]), false)
+            .await;
         match result {
             Ok(_) => {
-                tracing::debug!("worker#{worker_id} processed blob {}", &blob_name[..12.min(blob_name.len())]);
+                tracing::debug!(
+                    "worker#{worker_id} processed blob {}",
+                    &blob_name[..12.min(blob_name.len())]
+                );
             }
             Err(exc) => {
                 tracing::warn!("worker#{worker_id} process 失败 blob {blob_name}: {exc}");
@@ -147,7 +156,9 @@ async fn worker_loop(
                     let _ = repo.save(&blob).await;
                     if exceeded {
                         let _ = repo.delete_staging(&blob_name).await;
-                        tracing::error!("worker#{worker_id} blob {blob_name} 重试超限 → error, staging 已清理");
+                        tracing::error!(
+                            "worker#{worker_id} blob {blob_name} 重试超限 → error, staging 已清理"
+                        );
                     }
                 }
                 if !exceeded {
@@ -155,6 +166,8 @@ async fn worker_loop(
                 }
             }
         }
-        queue.inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        queue
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

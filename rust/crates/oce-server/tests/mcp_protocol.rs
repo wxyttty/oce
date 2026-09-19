@@ -34,7 +34,10 @@ impl FakeEmbedder {
 
 #[async_trait::async_trait]
 impl oce_core::search::Embedder for FakeEmbedder {
-    async fn embed_documents(&self, texts: Vec<String>) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
+    async fn embed_documents(
+        &self,
+        texts: Vec<String>,
+    ) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.embed(t)).collect())
     }
     async fn embed_query(&self, text: &str) -> oce_core::error::OceResult<Vec<f32>> {
@@ -59,9 +62,10 @@ async fn indexer_for(tag: &str) -> Arc<WorkspaceIndexer> {
     settings.retrieval.inner.query_decomposition_enabled = false;
     settings.llm.rerank_enabled = false;
     settings.retrieval.inner.query_rewrite_enabled = false;
-    let container = Container::build_with_embedder(settings, Some(Arc::new(FakeEmbedder { dim: 8 })))
-        .await
-        .unwrap();
+    let container =
+        Container::build_with_embedder(settings, Some(Arc::new(FakeEmbedder { dim: 8 })))
+            .await
+            .unwrap();
     Arc::new(WorkspaceIndexer::new(
         dir,
         container.application.indexing.clone(),
@@ -104,9 +108,12 @@ async fn initialize_and_tools_list() {
     .await;
     assert!(none.is_none());
 
-    let tools = oce_server::mcp::handle_message(&state, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
-        .await
-        .unwrap();
+    let tools = oce_server::mcp::handle_message(
+        &state,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await
+    .unwrap();
     let names: Vec<&str> = tools
         .pointer("/result/tools")
         .and_then(|t| t.as_array())
@@ -145,7 +152,10 @@ async fn tool_call_search_roundtrip() {
     .await
     .unwrap();
     let payload = content_text(&resp);
-    assert!(payload["hit_count"].as_u64().unwrap() >= 1, "payload={payload}");
+    assert!(
+        payload["hit_count"].as_u64().unwrap() >= 1,
+        "payload={payload}"
+    );
     assert!(payload["formatted_retrieval"]
         .as_str()
         .unwrap()

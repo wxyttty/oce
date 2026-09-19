@@ -32,7 +32,9 @@ impl SqlMetricsSink {
     /// 立即落库缓冲内容（后台 flush 任务或 drop 前调用）。
     pub async fn flush(&self) {
         let (tokens, retrievals, api_calls, resources) = {
-            let Ok(mut buf) = self.buffer.lock() else { return };
+            let Ok(mut buf) = self.buffer.lock() else {
+                return;
+            };
             (
                 std::mem::take(&mut buf.tokens),
                 std::mem::take(&mut buf.retrievals),
@@ -40,7 +42,11 @@ impl SqlMetricsSink {
                 std::mem::take(&mut buf.resources),
             )
         };
-        if tokens.is_empty() && retrievals.is_empty() && api_calls.is_empty() && resources.is_empty() {
+        if tokens.is_empty()
+            && retrievals.is_empty()
+            && api_calls.is_empty()
+            && resources.is_empty()
+        {
             return;
         }
         let db = self.db.clone();
@@ -212,9 +218,8 @@ impl SqlMetricsSink {
         let db = self.db.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let _ = db.with_conn(|conn| {
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::days(retention_days as i64))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 for table in [
                     "api_call_metrics",
                     "token_usage_metrics",
@@ -230,7 +235,11 @@ impl SqlMetricsSink {
     }
 
     /// 启动周期清理任务（对应 Python MonitoringCleaner：按 retention_days 清过期监控行）。
-    pub fn spawn_cleanup_task(self: std::sync::Arc<Self>, retention_days: u32, interval_seconds: f64) {
+    pub fn spawn_cleanup_task(
+        self: std::sync::Arc<Self>,
+        retention_days: u32,
+        interval_seconds: f64,
+    ) {
         let sink = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs_f64(

@@ -4,7 +4,8 @@
 use oce_core::search::Embedder;
 
 /// 用户实测失败的查询（中文业务术语）
-const QUERY_A: &str = "三明代发：调拨单打印与发货汇总单打印的期号(期数)逻辑，期号如何生成、写入、按期号查询汇总数据";
+const QUERY_A: &str =
+    "三明代发：调拨单打印与发货汇总单打印的期号(期数)逻辑，期号如何生成、写入、按期号查询汇总数据";
 /// 用户实测成功的表述（贴近字段名）
 const QUERY_B: &str = "package count remainder calcPkQty proxyPackageQty print form";
 
@@ -37,13 +38,27 @@ fn probe(model_id: &str) {
         println!("  dim={}", e.dim());
         let qa = e.embed_query(QUERY_A).await.unwrap();
         let qb = e.embed_query(QUERY_B).await.unwrap();
-        let chunks = e.embed_documents(vec![POSITIVE.into(), NEGATIVE.into()]).await.unwrap();
+        let chunks = e
+            .embed_documents(vec![POSITIVE.into(), NEGATIVE.into()])
+            .await
+            .unwrap();
         let (pos, neg) = (&chunks[0], &chunks[1]);
-        println!("  queryA(中文业务) -> 正例 {:.4} | 负例 {:.4} | margin {:+.4}",
-            cos(&qa, pos), cos(&qa, neg), cos(&qa, pos) - cos(&qa, neg));
-        println!("  queryB(字段名)   -> 正例 {:.4} | 负例 {:.4} | margin {:+.4}",
-            cos(&qb, pos), cos(&qb, neg), cos(&qb, pos) - cos(&qb, neg));
-        println!("  正例 vs 负例 chunk 相似度 {:.4}（越接近 1 = 全库向量趋同）", cos(pos, neg));
+        println!(
+            "  queryA(中文业务) -> 正例 {:.4} | 负例 {:.4} | margin {:+.4}",
+            cos(&qa, pos),
+            cos(&qa, neg),
+            cos(&qa, pos) - cos(&qa, neg)
+        );
+        println!(
+            "  queryB(字段名)   -> 正例 {:.4} | 负例 {:.4} | margin {:+.4}",
+            cos(&qb, pos),
+            cos(&qb, neg),
+            cos(&qb, pos) - cos(&qb, neg)
+        );
+        println!(
+            "  正例 vs 负例 chunk 相似度 {:.4}（越接近 1 = 全库向量趋同）",
+            cos(pos, neg)
+        );
     });
 }
 

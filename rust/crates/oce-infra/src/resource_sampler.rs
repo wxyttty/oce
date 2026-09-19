@@ -11,7 +11,9 @@ use std::time::Duration;
 /// 递归累加目录内文件字节数；单个文件不可读则跳过，整体不可达返回 0。
 fn dir_size(path: &Path) -> u64 {
     fn walk(dir: &Path, total: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             match entry.file_type() {
                 Ok(t) if t.is_file() => {
@@ -121,8 +123,7 @@ impl ResourceSampler {
                 ticker.tick().await;
                 // 采集在阻塞线程执行（目录递归可能较慢），上报走旁路
                 let dir = data_dir.as_deref().map(std::path::PathBuf::from);
-                let record = tokio::task::spawn_blocking(move || collect(dir.as_deref()))
-                    .await;
+                let record = tokio::task::spawn_blocking(move || collect(dir.as_deref())).await;
                 match record {
                     Ok(record) => sink.record_resource_sample(record),
                     Err(e) => tracing::warn!("resource sample join error: {e}"),

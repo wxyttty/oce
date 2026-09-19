@@ -9,9 +9,10 @@
 //! 全量重建由 `reindex()` 显式触发。
 
 use oce_core::error::{OceError, OceResult};
-use oce_core::formatter::format_retrieval;
+use oce_core::formatter::{format_retrieval_with_notes, RetrievalNotes};
 use oce_core::indexing::{BlobRepository, IndexingPipeline};
 use oce_core::retrieval::RetrievalPipeline;
+use oce_core::search::RetrievalAudit;
 use oce_infra::sqlite::repos::SqlBlobRepository;
 use oce_infra::sqlite::SqlDb;
 use rayon::prelude::*;
@@ -24,10 +25,31 @@ use std::time::Instant;
 const MAX_FILE_BYTES: u64 = 1_000_000;
 
 /// 默认忽略的目录名（配合 .gitignore/.oceignore 使用；.git 内容必须排除）。
-const DEFAULT_IGNORED_DIRS: [&str; 15] = [
-    ".git", ".oce", "node_modules", "target", "dist", "build", "out",
-    "__pycache__", ".venv", "venv", ".pytest_cache", ".idea", ".vscode",
-    "vendor", "coverage",
+/// AI 工具目录与 source_filter 的 IGNORED_DIRECTORY_NAMES 同源：settings/
+/// 规则/缓存不是检索上下文，config 类查询上得分虚高。
+const DEFAULT_IGNORED_DIRS: [&str; 22] = [
+    ".git",
+    ".oce",
+    ".claude",
+    ".cursor",
+    ".windsurf",
+    ".trae",
+    ".roo",
+    ".zed",
+    ".fleet",
+    ".idea",
+    ".vscode",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    "vendor",
+    "coverage",
 ];
 
 /// 一个文件的扫描结果（轻量字段，walk 阶段即可比对）。
@@ -303,9 +325,22 @@ impl WorkspaceIndexer {
         let names = self.current_blob_names().await?;
         let started = Instant::now();
         // RetrievalPipeline::search 返回 Vec<SearchHit>（非 Result）
-        let hits = self.retrieval.search(query, Some(&names), None).await;
+        let mut audit = RetrievalAudit::default();
+        let hits = self
+            .retrieval
+            .search(query, Some(&names), Some(&mut audit))
+            .await;
         let elapsed_ms = started.elapsed().as_millis() as i64;
-        let formatted = format_retrieval(&hits);
+        let notes = RetrievalNotes {
+            weak: audit.weak_match,
+            degraded: audit.semantic_degraded,
+            broad: audit.broad,
+        };
+        let formatted = if audit.related_symbols.is_empty() {
+            format_retrieval_with_notes(&hits, &notes)
+        } else {
+            oce_core::formatter::format_retrieval_full(&hits, &notes, &audit.related_symbols)
+        };
         Ok(SearchOutcome {
             hit_count: hits.len(),
             formatted,

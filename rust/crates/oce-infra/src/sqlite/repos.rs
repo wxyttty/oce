@@ -12,7 +12,6 @@ use oce_core::symbol::SymbolExtractor;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-
 pub struct SqlBlobRepository {
     pub db: SqlDb,
 }
@@ -90,15 +89,23 @@ fn insert_chunks_and_symbols(
             ])
             .map_err(|e| e.to_string())?;
     }
-    let mut stmt_symbol = tx.prepare_cached(
-        "INSERT OR IGNORE INTO symbol_occurrences
+    let mut stmt_symbol = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO symbol_occurrences
          (identifier, blob_name, content_hash, kind, start_line, end_line)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )
-    .map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
     for (identifier, kind, content_hash, start, end) in &symbol_values {
         stmt_symbol
-            .execute(rusqlite::params![identifier, blob_name, content_hash, kind, start, end])
+            .execute(rusqlite::params![
+                identifier,
+                blob_name,
+                content_hash,
+                kind,
+                start,
+                end
+            ])
             .map_err(|e| e.to_string())?;
     }
     let mut stmt_blob_chunk = tx.prepare_cached(
@@ -138,9 +145,7 @@ fn extract_symbols_for_refs_parallel(
 }
 
 /// 符号提取（正则密集）在块数多时用 rayon 并行；少量块顺序执行避免线程开销。
-fn extract_symbols_parallel(
-    chunks: &[Chunk],
-) -> Vec<(String, String, String, i64, i64)> {
+fn extract_symbols_parallel(chunks: &[Chunk]) -> Vec<(String, String, String, i64, i64)> {
     let extract_all = |chunk: &Chunk| -> Vec<(String, String, String, i64, i64)> {
         SymbolExtractor::extract_symbols(&chunk.content, chunk.start_line, chunk.end_line)
             .into_iter()
@@ -156,10 +161,7 @@ fn extract_symbols_parallel(
             .collect()
     };
     if chunks.len() >= 8 {
-        chunks
-            .par_iter()
-            .flat_map(extract_all)
-            .collect()
+        chunks.par_iter().flat_map(extract_all).collect()
     } else {
         chunks.iter().flat_map(extract_all).collect()
     }
@@ -186,7 +188,10 @@ impl SqlBlobRepository {
     }
 
     /// bench 便捷入口：批量写 chunk 内容 + 符号 + 出现位置并标记已嵌入。
-    pub async fn save_chunks_and_mark(&self, located: &[oce_core::chunk::LocatedChunk]) -> OceResult<()> {
+    pub async fn save_chunks_and_mark(
+        &self,
+        located: &[oce_core::chunk::LocatedChunk],
+    ) -> OceResult<()> {
         let chunks: Vec<Chunk> = located
             .iter()
             .map(|l| {
@@ -223,7 +228,9 @@ impl BlobRepository for SqlBlobRepository {
             db.with_conn(|conn| {
                 let chunks = load_chunks(conn, &name);
                 let mut stmt = conn
-                    .prepare(&format!("SELECT {BLOB_COLS} FROM blobs WHERE blob_name = ?1"))
+                    .prepare(&format!(
+                        "SELECT {BLOB_COLS} FROM blobs WHERE blob_name = ?1"
+                    ))
                     .map_err(|e| e.to_string())?;
                 match stmt.query_row([&name], |row| row_to_blob(row, chunks)) {
                     Ok(blob) => Ok(Some(blob)),
@@ -347,8 +354,11 @@ impl BlobRepository for SqlBlobRepository {
                     .map_err(|e| e.to_string())?;
                 conn.execute("DELETE FROM blobs WHERE blob_name = ?1", [&name])
                     .map_err(|e| e.to_string())?;
-                conn.execute("DELETE FROM symbol_occurrences WHERE blob_name = ?1", [&name])
-                    .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "DELETE FROM symbol_occurrences WHERE blob_name = ?1",
+                    [&name],
+                )
+                .map_err(|e| e.to_string())?;
                 for hash in &hashes {
                     conn.execute(
                         "DELETE FROM chunks WHERE content_hash = ?1
@@ -489,7 +499,9 @@ impl BlobRepository for SqlBlobRepository {
                     .prepare("SELECT blob_name FROM blobs WHERE last_seen < ?1 LIMIT ?2")
                     .map_err(|e| e.to_string())?;
                 let rows = stmt
-                    .query_map(rusqlite::params![threshold, batch_size as i64], |r| r.get(0))
+                    .query_map(rusqlite::params![threshold, batch_size as i64], |r| {
+                        r.get(0)
+                    })
                     .map_err(|e| e.to_string())?;
                 Ok(rows.filter_map(|r| r.ok()).collect())
             })
@@ -531,10 +543,11 @@ impl BlobRepository for SqlBlobRepository {
                 for name in &names {
                     let chunks = load_chunks(conn, name);
                     let mut stmt = conn
-                        .prepare(&format!("SELECT {BLOB_COLS} FROM blobs WHERE blob_name = ?1"))
+                        .prepare(&format!(
+                            "SELECT {BLOB_COLS} FROM blobs WHERE blob_name = ?1"
+                        ))
                         .map_err(|e| e.to_string())?;
-                    if let Ok(blob) =
-                        stmt.query_row([name], |row| row_to_blob(row, chunks.clone()))
+                    if let Ok(blob) = stmt.query_row([name], |row| row_to_blob(row, chunks.clone()))
                     {
                         out.insert(name.clone(), blob);
                     }

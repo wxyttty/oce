@@ -302,7 +302,10 @@ fn bucket_ts(ts: &str, bucket: &str) -> String {
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap());
     let truncated = if bucket == "day" {
-        dt.date_naive().and_hms_opt(0, 0, 0).map(|t| Utc.from_utc_datetime(&t)).unwrap()
+        dt.date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|t| Utc.from_utc_datetime(&t))
+            .unwrap()
     } else {
         dt.date_naive()
             .and_hms_opt(dt.time().hour(), 0, 0)
@@ -329,7 +332,14 @@ fn scope_label(scope_size: Option<i64>) -> &'static str {
 
 /// 检索管线阶段名（对应 retrieval_metrics 的 <stage>_ms 列）。
 const STAGE_NAMES: [&str; 8] = [
-    "intent", "rewrite", "dense", "exact", "fuse", "rerank", "llm_rerank", "select",
+    "intent",
+    "rewrite",
+    "dense",
+    "exact",
+    "fuse",
+    "rerank",
+    "llm_rerank",
+    "select",
 ];
 
 const SCOPE_LABELS: [&str; 5] = ["1-100", "101-1000", "1001-10000", ">10000", "unknown"];
@@ -353,7 +363,9 @@ const SPACE_TABLES: [&str; 12] = [
 /// 递归累加目录内文件字节数；不可读的文件跳过。
 fn dir_size_bytes(path: &std::path::Path) -> i64 {
     fn walk(dir: &std::path::Path, total: &mut i64) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             match entry.file_type() {
                 Ok(t) if t.is_file() => {
@@ -422,7 +434,11 @@ impl ReportsReader {
 
     // ───────────────────────── API 健康
 
-    pub async fn api_calls(&self, window_hours: u32, bucket: &str) -> Result<ApiCallsReport, String> {
+    pub async fn api_calls(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> Result<ApiCallsReport, String> {
         check_bucket(bucket)?;
         let cutoff = cutoff(window_hours);
 
@@ -436,28 +452,30 @@ impl ReportsReader {
             latency: i64,
             error_type: Option<String>,
         }
-        let rows: Vec<Row> = self.read(move |conn| {
-            let cutoff = cutoff.clone();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ts, endpoint, method, status_code, latency_ms, error_type
+        let rows: Vec<Row> = self
+            .read(move |conn| {
+                let cutoff = cutoff.clone();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT ts, endpoint, method, status_code, latency_ms, error_type
                      FROM api_call_metrics WHERE ts >= ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([&cutoff], |r| {
-                    Ok(Row {
-                        ts: r.get(0)?,
-                        endpoint: r.get(1)?,
-                        method: r.get(2)?,
-                        status: r.get(3)?,
-                        latency: r.get(4)?,
-                        error_type: r.get(5)?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([&cutoff], |r| {
+                        Ok(Row {
+                            ts: r.get(0)?,
+                            endpoint: r.get(1)?,
+                            method: r.get(2)?,
+                            status: r.get(3)?,
+                            latency: r.get(4)?,
+                            error_type: r.get(5)?,
+                        })
                     })
-                })
-                .map_err(|e| e.to_string())?;
-            Ok(rows.filter_map(|r| r.ok()).collect())
-        }).await;
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .await;
 
         let mut by_bucket: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
         let mut by_endpoint: HashMap<(String, String), Vec<(i64, i64)>> = HashMap::new();
@@ -542,7 +560,11 @@ impl ReportsReader {
 
     // ───────────────────────── 检索质量
 
-    pub async fn retrieval(&self, window_hours: u32, bucket: &str) -> Result<RetrievalReport, String> {
+    pub async fn retrieval(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> Result<RetrievalReport, String> {
         check_bucket(bucket)?;
         let cutoff = cutoff(window_hours);
 
@@ -592,10 +614,11 @@ impl ReportsReader {
                 .entry(bucket_ts(&row.ts, bucket))
                 .or_default()
                 .push((row.hit_count, row.total_ms));
-            by_intent
-                .entry(row.intent.clone())
-                .or_default()
-                .push((row.hit_count, row.total_ms, row.path_boosted));
+            by_intent.entry(row.intent.clone()).or_default().push((
+                row.hit_count,
+                row.total_ms,
+                row.path_boosted,
+            ));
             by_scope
                 .entry(scope_label(row.scope_size))
                 .or_default()
@@ -619,7 +642,9 @@ impl ReportsReader {
                     count: count as u64,
                     empty_count: empty as u64,
                     empty_rate: round4(empty as f64 / count as f64),
-                    avg_hit_count: round2(samples.iter().map(|(h, _)| *h).sum::<i64>() as f64 / count as f64),
+                    avg_hit_count: round2(
+                        samples.iter().map(|(h, _)| *h).sum::<i64>() as f64 / count as f64,
+                    ),
                     avg_total_ms: round2(totals.iter().sum::<i64>() as f64 / count as f64),
                     p95_total_ms: percentile(&totals, 95),
                 }
@@ -652,7 +677,9 @@ impl ReportsReader {
                     count: count as u64,
                     empty_count: empty as u64,
                     empty_rate: round4(empty as f64 / count as f64),
-                    avg_total_ms: round2(samples.iter().map(|(_, t, _)| *t).sum::<i64>() as f64 / count as f64),
+                    avg_total_ms: round2(
+                        samples.iter().map(|(_, t, _)| *t).sum::<i64>() as f64 / count as f64,
+                    ),
                     path_boosted_count: samples.iter().filter(|(_, _, b)| *b).count() as u64,
                 }
             })
@@ -669,7 +696,9 @@ impl ReportsReader {
                 Some(ScopeBucketStat {
                     label: label.to_string(),
                     count: count as u64,
-                    empty_rate: round4(samples.iter().filter(|(h, _)| *h == 0).count() as f64 / count as f64),
+                    empty_rate: round4(
+                        samples.iter().filter(|(h, _)| *h == 0).count() as f64 / count as f64,
+                    ),
                     p95_total_ms: percentile(&totals, 95),
                 })
             })
@@ -685,7 +714,11 @@ impl ReportsReader {
         })
     }
 
-    pub async fn slow_queries(&self, window_hours: u32, limit: u32) -> Result<Vec<RetrievalQueryDetail>, String> {
+    pub async fn slow_queries(
+        &self,
+        window_hours: u32,
+        limit: u32,
+    ) -> Result<Vec<RetrievalQueryDetail>, String> {
         let cutoff = cutoff(window_hours);
         let items = self.read(move |conn| {
             let (cutoff, limit) = (cutoff.clone(), limit);
@@ -703,7 +736,11 @@ impl ReportsReader {
         Ok(items)
     }
 
-    pub async fn empty_queries(&self, window_hours: u32, limit: u32) -> Result<Vec<RetrievalQueryDetail>, String> {
+    pub async fn empty_queries(
+        &self,
+        window_hours: u32,
+        limit: u32,
+    ) -> Result<Vec<RetrievalQueryDetail>, String> {
         let cutoff = cutoff(window_hours);
         let items = self.read(move |conn| {
             let (cutoff, limit) = (cutoff.clone(), limit);
@@ -834,78 +871,93 @@ impl ReportsReader {
     // ───────────────────────── 索引资产
 
     pub async fn index_inventory(&self) -> Result<IndexInventoryReport, String> {
-        let report = self.read(|conn| {
-            let count = |sql: &str| -> i64 {
-                conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0)
-            };
-            let blob_row: (i64, i64) = conn
-                .query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(content_size), 0) FROM blobs",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or((0, 0));
-            let group = |sql: &str| -> Vec<CountStat> {
-                let Ok(mut stmt) = conn.prepare(sql) else { return Vec::new() };
-                let Ok(rows) = stmt.query_map([], |r| {
-                    Ok(CountStat {
-                        key: r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "unknown".into()),
-                        count: r.get::<_, i64>(1)?.max(0) as u64,
-                    })
-                }) else {
-                    return Vec::new();
+        let report = self
+            .read(|conn| {
+                let count =
+                    |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+                let blob_row: (i64, i64) = conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(content_size), 0) FROM blobs",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or((0, 0));
+                let group = |sql: &str| -> Vec<CountStat> {
+                    let Ok(mut stmt) = conn.prepare(sql) else {
+                        return Vec::new();
+                    };
+                    let Ok(rows) = stmt.query_map([], |r| {
+                        Ok(CountStat {
+                            key: r
+                                .get::<_, Option<String>>(0)?
+                                .unwrap_or_else(|| "unknown".into()),
+                            count: r.get::<_, i64>(1)?.max(0) as u64,
+                        })
+                    }) else {
+                        return Vec::new();
+                    };
+                    rows.filter_map(|r| r.ok()).collect()
                 };
-                rows.filter_map(|r| r.ok()).collect()
-            };
-            let now = Utc::now();
-            let stale = |days: i64| -> u64 {
-                let threshold = (now - Duration::days(days))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                conn.query_row(
-                    "SELECT COUNT(*) FROM chains WHERE updated_at < ?1",
-                    [&threshold],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-                .max(0) as u64
-            };
-            let chunk_row: (i64, i64) = conn
-                .query_row(
-                    "SELECT COUNT(*), COALESCE(SUM(content_size), 0) FROM chunks",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or((0, 0));
-            Ok(IndexInventoryReport {
-                blob_total: blob_row.0.max(0) as u64,
-                blob_by_status: group("SELECT status, COUNT(*) FROM blobs GROUP BY status"),
-                blob_by_language: {
-                    let mut v = group("SELECT language, COUNT(*) FROM blobs GROUP BY language");
-                    v.sort_by(|a, b| b.count.cmp(&a.count));
-                    v.truncate(30);
-                    v
-                },
-                blob_retrying: count("SELECT COUNT(*) FROM blobs WHERE retry_count > 0").max(0) as u64,
-                blob_content_bytes: blob_row.1,
-                chunk_total: chunk_row.0.max(0) as u64,
-                chunk_pending_embed: count("SELECT COUNT(*) FROM chunks WHERE embedded = 0").max(0) as u64,
-                chunk_by_type: group("SELECT chunk_type, COUNT(*) FROM chunks GROUP BY chunk_type"),
-                chunk_content_bytes: chunk_row.1,
-                blob_chunk_links: count("SELECT COUNT(*) FROM blob_chunks").max(0) as u64,
-                symbol_total: count("SELECT COUNT(*) FROM symbol_occurrences").max(0) as u64,
-                symbol_by_kind: group("SELECT kind, COUNT(*) FROM symbol_occurrences GROUP BY kind"),
-                chain_total: count("SELECT COUNT(*) FROM chains").max(0) as u64,
-                chain_stale_7d: stale(7),
-                chain_stale_30d: stale(30),
-                staging_rows: count("SELECT COUNT(*) FROM blob_staging").max(0) as u64,
+                let now = Utc::now();
+                let stale = |days: i64| -> u64 {
+                    let threshold = (now - Duration::days(days))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM chains WHERE updated_at < ?1",
+                        [&threshold],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    .max(0) as u64
+                };
+                let chunk_row: (i64, i64) = conn
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(content_size), 0) FROM chunks",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or((0, 0));
+                Ok(IndexInventoryReport {
+                    blob_total: blob_row.0.max(0) as u64,
+                    blob_by_status: group("SELECT status, COUNT(*) FROM blobs GROUP BY status"),
+                    blob_by_language: {
+                        let mut v = group("SELECT language, COUNT(*) FROM blobs GROUP BY language");
+                        v.sort_by(|a, b| b.count.cmp(&a.count));
+                        v.truncate(30);
+                        v
+                    },
+                    blob_retrying: count("SELECT COUNT(*) FROM blobs WHERE retry_count > 0").max(0)
+                        as u64,
+                    blob_content_bytes: blob_row.1,
+                    chunk_total: chunk_row.0.max(0) as u64,
+                    chunk_pending_embed: count("SELECT COUNT(*) FROM chunks WHERE embedded = 0")
+                        .max(0) as u64,
+                    chunk_by_type: group(
+                        "SELECT chunk_type, COUNT(*) FROM chunks GROUP BY chunk_type",
+                    ),
+                    chunk_content_bytes: chunk_row.1,
+                    blob_chunk_links: count("SELECT COUNT(*) FROM blob_chunks").max(0) as u64,
+                    symbol_total: count("SELECT COUNT(*) FROM symbol_occurrences").max(0) as u64,
+                    symbol_by_kind: group(
+                        "SELECT kind, COUNT(*) FROM symbol_occurrences GROUP BY kind",
+                    ),
+                    chain_total: count("SELECT COUNT(*) FROM chains").max(0) as u64,
+                    chain_stale_7d: stale(7),
+                    chain_stale_30d: stale(30),
+                    staging_rows: count("SELECT COUNT(*) FROM blob_staging").max(0) as u64,
+                })
             })
-        }).await;
+            .await;
         Ok(report)
     }
 
     // ───────────────────────── 资源容量
 
-    pub async fn resources(&self, window_hours: u32, bucket: &str) -> Result<ResourcesReport, String> {
+    pub async fn resources(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> Result<ResourcesReport, String> {
         check_bucket(bucket)?;
         let cutoff = cutoff(window_hours);
 
@@ -951,7 +1003,10 @@ impl ReportsReader {
 
         let mut by_bucket: HashMap<String, Vec<&Row>> = HashMap::new();
         for row in &rows {
-            by_bucket.entry(bucket_ts(&row.ts, bucket)).or_default().push(row);
+            by_bucket
+                .entry(bucket_ts(&row.ts, bucket))
+                .or_default()
+                .push(row);
         }
         let mut buckets: Vec<ResourceBucket> = by_bucket
             .into_iter()
@@ -960,9 +1015,13 @@ impl ReportsReader {
                 let last = samples[count - 1];
                 ResourceBucket {
                     ts,
-                    avg_cpu_percent: round2(samples.iter().map(|r| r.cpu).sum::<f64>() / count as f64),
+                    avg_cpu_percent: round2(
+                        samples.iter().map(|r| r.cpu).sum::<f64>() / count as f64,
+                    ),
                     max_cpu_percent: samples.iter().map(|r| r.cpu).fold(f64::MIN, f64::max),
-                    avg_mem_percent: round2(samples.iter().map(|r| r.mem_percent).sum::<f64>() / count as f64),
+                    avg_mem_percent: round2(
+                        samples.iter().map(|r| r.mem_percent).sum::<f64>() / count as f64,
+                    ),
                     max_mem_rss_bytes: samples.iter().map(|r| r.mem_rss).max().unwrap_or(0),
                     disk_data_bytes: last.disk_data,
                     disk_free_bytes: last.disk_free,
@@ -1005,38 +1064,40 @@ impl ReportsReader {
     // ───────────────────────── 空间占用
 
     pub async fn storage(&self) -> Result<StorageReport, String> {
-        let tables: Vec<TableSpaceStat> = self.read(|conn| {
-            Ok(SPACE_TABLES
-                .iter()
-                .map(|name| {
-                    let rows: i64 = conn
-                        .query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))
-                        .unwrap_or(0);
-                    // dbstat 虚表可能未编译进 bundled SQLite；失败降级为估算标记
-                    let dbstat: Option<Option<i64>> = conn
-                        .query_row(
-                            "SELECT SUM(pgsize) FROM dbstat WHERE name = ?1",
-                            [name],
-                            |r| r.get(0),
-                        )
-                        .ok();
-                    match dbstat {
-                        Some(bytes) => TableSpaceStat {
-                            table: name.to_string(),
-                            bytes: bytes.unwrap_or(0),
-                            rows,
-                            approximate: false,
-                        },
-                        None => TableSpaceStat {
-                            table: name.to_string(),
-                            bytes: 0,
-                            rows,
-                            approximate: true,
-                        },
-                    }
-                })
-                .collect())
-        }).await;
+        let tables: Vec<TableSpaceStat> = self
+            .read(|conn| {
+                Ok(SPACE_TABLES
+                    .iter()
+                    .map(|name| {
+                        let rows: i64 = conn
+                            .query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))
+                            .unwrap_or(0);
+                        // dbstat 虚表可能未编译进 bundled SQLite；失败降级为估算标记
+                        let dbstat: Option<Option<i64>> = conn
+                            .query_row(
+                                "SELECT SUM(pgsize) FROM dbstat WHERE name = ?1",
+                                [name],
+                                |r| r.get(0),
+                            )
+                            .ok();
+                        match dbstat {
+                            Some(bytes) => TableSpaceStat {
+                                table: name.to_string(),
+                                bytes: bytes.unwrap_or(0),
+                                rows,
+                                approximate: false,
+                            },
+                            None => TableSpaceStat {
+                                table: name.to_string(),
+                                bytes: 0,
+                                rows,
+                                approximate: true,
+                            },
+                        }
+                    })
+                    .collect())
+            })
+            .await;
 
         // 文件系统统计：任何异常降级为空结果，绝不让 storage() 抛错
         let (data_dir, data_files, data_dir_total) = match &self.data_dir {

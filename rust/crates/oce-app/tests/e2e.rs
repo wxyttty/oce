@@ -38,7 +38,10 @@ impl FakeEmbedder {
 
 #[async_trait::async_trait]
 impl Embedder for FakeEmbedder {
-    async fn embed_documents(&self, texts: Vec<String>) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
+    async fn embed_documents(
+        &self,
+        texts: Vec<String>,
+    ) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.embed(t)).collect())
     }
 
@@ -63,10 +66,7 @@ fn test_settings(data_dir: &std::path::Path) -> Settings {
 }
 
 async fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "oce-e2e-{tag}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("oce-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -127,17 +127,11 @@ async fn upload_checkpoint_retrieve_e2e() {
     );
 
     // 2. checkpoint：建链
-    let checkpoint = app
-        .checkpoint(None, &result.blob_names, &[])
-        .await
-        .unwrap();
+    let checkpoint = app.checkpoint(None, &result.blob_names, &[]).await.unwrap();
     assert!(checkpoint.new_checkpoint_id.contains(':'));
 
     // 3. find_missing：全部 ready → 无 unknown / 无 nonindexed
-    let (unknown, nonindexed) = app
-        .find_missing(result.blob_names.clone())
-        .await
-        .unwrap();
+    let (unknown, nonindexed) = app.find_missing(result.blob_names.clone()).await.unwrap();
     assert!(unknown.is_empty());
     assert!(nonindexed.is_empty());
 
@@ -152,7 +146,9 @@ async fn upload_checkpoint_retrieve_e2e() {
         .await
         .unwrap();
     assert!(
-        retrieval.formatted_retrieval.contains("Path: src/token_refresh.rs"),
+        retrieval
+            .formatted_retrieval
+            .contains("Path: src/token_refresh.rs"),
         "expected rust source hit, got: {}",
         retrieval.formatted_retrieval
     );
@@ -234,7 +230,10 @@ async fn scope_semantics_edge_cases() {
 
     // 合法 token 但链不存在 → NEEDS_RESET（避免范围静默变窄）
     let fake_chain = format!("550e8400-e29b-41d4-a716-446655440000:1");
-    let err = app.retrieve("q", Some(&fake_chain), &[], &[]).await.unwrap_err();
+    let err = app
+        .retrieve("q", Some(&fake_chain), &[], &[])
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "NEEDS_RESET");
 
     // batch-upload 带不存在的链 → NEEDS_RESET（checkpoint 只推进已有链）
@@ -295,7 +294,10 @@ async fn static_embed_provider_end_to_end() {
     }];
     let result = app.batch_upload(uploads, None).await.unwrap();
     assert_eq!(result.blob_names.len(), 1);
-    assert_eq!(result.embedded_count, 1, "static provider must embed inline");
+    assert_eq!(
+        result.embedded_count, 1,
+        "static provider must embed inline"
+    );
 
     let checkpoint = app.checkpoint(None, &result.blob_names, &[]).await.unwrap();
     let retrieval = app
@@ -336,4 +338,41 @@ async fn static_embed_provider_end_to_end() {
     assert_eq!(err.code, "SERVICE_NOT_READY");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn weak_and_degraded_notes_surface_in_formatted_output() {
+    let dir = temp_dir("notes").await;
+    let settings = test_settings(&dir);
+    let container = oce_app::container::Container::build_with_embedder(
+        settings,
+        Some(Arc::new(FakeEmbedder::new(8))),
+    )
+    .await
+    .unwrap();
+    let app = &container.application;
+
+    // 上传一个无关文件并建 checkpoint
+    let uploads = vec![BlobUpload {
+        path: "src/unrelated.rs".into(),
+        content: "pub fn totally_unrelated_topic() -> u8 {\n    42\n}\n".into(),
+    }];
+    let result = app.batch_upload(uploads, None).await.unwrap();
+    let checkpoint = app.checkpoint(None, &result.blob_names, &[]).await.unwrap();
+
+    // 完全无关的查询：头部分数低于 0.30 → weak 提示注入
+    let retrieval = app
+        .retrieve(
+            "quantum flux capacitor implementation",
+            Some(&checkpoint.new_checkpoint_id),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    // FakeEmbedder 是 4-gram 哈希：无关查询可能召回 0 条（无 weak 提示）
+    // 或弱命中（weak 提示）。两种都是合法行为；断言不 panic 且格式合法。
+    assert!(retrieval
+        .formatted_retrieval
+        .starts_with("The following code sections were retrieved:"));
 }

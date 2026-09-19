@@ -30,8 +30,7 @@ impl SqlDb {
             .map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(30))
             .map_err(|e| e.to_string())?;
-        conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| e.to_string())?;
+        conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -46,8 +45,14 @@ impl SqlDb {
     }
 
     /// 在连接上执行阻塞操作（内部持锁）。
-    pub fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
-        let mut guard = self.conn.lock().map_err(|_| "sqlite lock poisoned".to_string())?;
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| "sqlite lock poisoned".to_string())?;
         f(&mut guard)
     }
 

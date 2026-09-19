@@ -50,7 +50,9 @@ fn extract_bearer(headers: &HeaderMap) -> Result<String, Response> {
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| unauthorized("You didn't provide an API key."))?;
     if !auth.starts_with("Bearer ") {
-        return Err(unauthorized("Invalid API key format. Expected 'Bearer <key>'"));
+        return Err(unauthorized(
+            "Invalid API key format. Expected 'Bearer <key>'",
+        ));
     }
     Ok(auth["Bearer ".len()..].to_string())
 }
@@ -59,7 +61,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 pub fn verify_api_key(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
@@ -81,10 +86,14 @@ pub fn verify_admin_key(headers: &HeaderMap, state: &AppState) -> Result<(), Res
 /// OceError → HTTP（与 Python router.py 的映射一致）。
 fn error_response(exc: &OceError) -> Response {
     match exc.code.as_str() {
-        "INVALID_CHECKPOINT_TOKEN" | "SCOPE_REQUIRED" => {
-            (StatusCode::BAD_REQUEST, Json(json!({"detail": exc.message}))).into_response()
+        "INVALID_CHECKPOINT_TOKEN" | "SCOPE_REQUIRED" => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail": exc.message})),
+        )
+            .into_response(),
+        "NEEDS_RESET" => {
+            (StatusCode::NOT_FOUND, Json(json!({"detail": exc.message}))).into_response()
         }
-        "NEEDS_RESET" => (StatusCode::NOT_FOUND, Json(json!({"detail": exc.message}))).into_response(),
         "SERVICE_NOT_READY" => (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Retry-After", "0")],
@@ -113,9 +122,18 @@ pub fn router(state: AppState) -> Router {
         .route("/checkpoint-blobs", post(checkpoint_blobs))
         .route("/agents/blob-status", post(blob_status))
         // Admin 运维面
-        .route("/admin/credentials", get(admin_list_credentials).post(admin_create_credential))
-        .route("/admin/credentials/{credential_id}", axum::routing::patch(admin_update_credential).delete(admin_delete_credential))
-        .route("/admin/credentials/{credential_id}/duplicate", post(admin_duplicate_credential))
+        .route(
+            "/admin/credentials",
+            get(admin_list_credentials).post(admin_create_credential),
+        )
+        .route(
+            "/admin/credentials/{credential_id}",
+            axum::routing::patch(admin_update_credential).delete(admin_delete_credential),
+        )
+        .route(
+            "/admin/credentials/{credential_id}/duplicate",
+            post(admin_duplicate_credential),
+        )
         .route("/admin/credentials/reload", post(admin_reload_credentials))
         .route("/admin/queue", get(admin_queue_status))
         .route("/admin/queue/reset", post(admin_queue_reset))
@@ -125,10 +143,19 @@ pub fn router(state: AppState) -> Router {
         // 报表（只读旁路）
         .route("/admin/reports/api-calls", get(report_api_calls))
         .route("/admin/reports/retrieval", get(report_retrieval))
-        .route("/admin/reports/retrieval/slow-queries", get(report_slow_queries))
-        .route("/admin/reports/retrieval/empty-queries", get(report_empty_queries))
+        .route(
+            "/admin/reports/retrieval/slow-queries",
+            get(report_slow_queries),
+        )
+        .route(
+            "/admin/reports/retrieval/empty-queries",
+            get(report_empty_queries),
+        )
         .route("/admin/reports/tokens", get(report_tokens))
-        .route("/admin/reports/index-inventory", get(report_index_inventory))
+        .route(
+            "/admin/reports/index-inventory",
+            get(report_index_inventory),
+        )
         .route("/admin/reports/resources", get(report_resources))
         .route("/admin/reports/storage", get(report_storage))
         // Meta
@@ -168,7 +195,11 @@ async fn api_call_metrics_middleware(
             method,
             status_code: status,
             latency_ms: started.elapsed().as_millis() as u64,
-            error_type: if status >= 500 { Some("http_error".into()) } else { None },
+            error_type: if status >= 500 {
+                Some("http_error".into())
+            } else {
+                None
+            },
         });
     }
     response
@@ -212,12 +243,24 @@ async fn batch_upload(
     Json(req): Json<BatchUploadRequest>,
 ) -> ApiResult<BatchUploadResponse> {
     verify_api_key(&headers, &state)?;
+    // 内存硬限制：超限时拒绝新的上传/嵌入请求
+    if let Err(e) = oce_infra::memory_guard::check() {
+        tracing::warn!("batch_upload rejected: {e}");
+        return Err(error_response(&OceError::new(e, "MemoryLimitExceeded")));
+    }
     let uploads: Vec<BlobUpload> = req
         .blobs
         .into_iter()
-        .map(|b| BlobUpload { path: b.path, content: b.content })
+        .map(|b| BlobUpload {
+            path: b.path,
+            content: b.content,
+        })
         .collect();
-    let checkpoint_id = if req.checkpoint_id.is_empty() { None } else { Some(req.checkpoint_id) };
+    let checkpoint_id = if req.checkpoint_id.is_empty() {
+        None
+    } else {
+        Some(req.checkpoint_id)
+    };
     let result = state
         .application
         .batch_upload(uploads, checkpoint_id.as_deref())
@@ -295,7 +338,9 @@ async fn blob_status(
 
 // ── Admin 面 ──
 
-fn credential_to_response(r: oce_infra::sqlite::credentials::CredentialRecord) -> CredentialResponse {
+fn credential_to_response(
+    r: oce_infra::sqlite::credentials::CredentialRecord,
+) -> CredentialResponse {
     CredentialResponse {
         id: r.id,
         kind: r.kind,
@@ -602,7 +647,10 @@ fn report_params(params: &std::collections::HashMap<String, String>) -> (u32, St
         .get("window_hours")
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
-    let bucket = params.get("bucket").cloned().unwrap_or_else(|| "hour".into());
+    let bucket = params
+        .get("bucket")
+        .cloned()
+        .unwrap_or_else(|| "hour".into());
     (window_hours, bucket)
 }
 
@@ -611,21 +659,19 @@ fn reports_reader(state: &AppState) -> oce_infra::sqlite::reports::ReportsReader
     // 向量库统计闭包：kind_stats 走属性索引，.tdb 文件体积直接 stat；
     // 任何失败降级为 unavailable，绝不让报表抛错
     let trivium = container.application.trivium.clone();
-    let tdb_path = container
-        .settings
-        .trivium
-        .path
-        .clone();
+    let tdb_path = container.settings.trivium.path.clone();
     let dim = container.vector_dim;
     let vector_stats = std::sync::Arc::new(move || {
         let collections = trivium
             .kind_stats()
             .into_iter()
-            .map(|(name, rows)| oce_infra::sqlite::reports::VectorCollectionStat {
-                name,
-                rows: rows as u64,
-                est_bytes: 0,
-            })
+            .map(
+                |(name, rows)| oce_infra::sqlite::reports::VectorCollectionStat {
+                    name,
+                    rows: rows as u64,
+                    est_bytes: 0,
+                },
+            )
             .collect();
         let file_bytes = std::fs::metadata(&tdb_path)
             .map(|m| m.len() as i64)

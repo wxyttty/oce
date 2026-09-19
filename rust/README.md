@@ -97,6 +97,19 @@ rust/
       杜绝跨模型向量静默污染
 - [x] `dist-*` 构建产物目录准入过滤（实测 dist-prod 混入索引稀释结果）
 - [x] 符号提取 rayon 并行化（≥8 块并行预提取，SQLite 事务内只批量写入）
+- [x] `RETRIEVAL_FILE_DESC_ENABLED`：清单/配置文件规则层描述注入 embedding_text 与
+      rerank 文档（BCE filedesc.go 移植；nollm 双仓 A/B +30.46 分，默认关）
+- [x] `RETRIEVAL_RELATED_SYMBOLS_ENABLED`：`<related_symbols>` grep leads 输出层追加
+      （BCE relatedSymbolHints 移植，fanout 门控 + 停用词过滤，默认关）
+- [x] `RETRIEVAL_BROAD_MODE_ENABLED`：架构/概览探索型查询专用 regime（BCE broad.go
+      移植：宽窗口 20 hits / per-path 2、manifest 结构先验进 RRF、超 28 行摘录骨架化
+      且省略段行号重同步、定位语气查询一票否决；基准 200 题无探索型查询故 A/B 零
+      差异，机制探针见 note，默认关）
+- [x] `RETRIEVAL_META_DIR_PENALTY_ENABLED`：.github 等 CI/模板目录 ×0.5 降权，CI
+      意图查询豁免（semble_rs M2 移植；.github 入窗 24→14，默认关）
+- [x] `RETRIEVAL_SPAN_MERGE_ENABLED`：相邻 span 合并 + 小片段补全（semble_rs M1
+      移植：≤2 行间隔合并、<6 行补全、chunk 行重构缺行回退、池加宽回填；大库下
+      覆盖选择器已防碎片化、基准面中性，受益面为小 scope 工作区，默认关）
 - [x] `oce doctor` 迁移/排障自检（只读，逐项报告 .env/SQLite/TriviumDB/嵌入提供方）
 - [ ] 服务模式：PostgreSQL（sqlx）、Redis 队列、Milvus gRPC 后端（trait 已留扩展点）
 - [ ] 资源采样器（sysinfo 磁盘/CPU 采样）、p50/p95 延迟聚合

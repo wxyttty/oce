@@ -1,7 +1,7 @@
 //! 静态查表嵌入的封闭测试：合成微型 Model2Vec 模型（无需下载真模型）。
 
-use oce_infra::settings::EmbeddingSettings;
 use oce_core::search::Embedder;
+use oce_infra::settings::EmbeddingSettings;
 use oce_infra::static_embed::StaticEmbedder;
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,7 +32,9 @@ fn write_synthetic_model(dir: &Path, dim: usize) -> String {
     let mut data = Vec::with_capacity(rows * dim * 4);
     for i in 0..rows {
         for j in 0..dim {
-            data.extend_from_slice(&(((i * dim + j) as f32 / (rows * dim) as f32 - 0.5).to_le_bytes()));
+            data.extend_from_slice(
+                &(((i * dim + j) as f32 / (rows * dim) as f32 - 0.5).to_le_bytes()),
+            );
         }
     }
     let mut tensors: HashMap<String, safetensors::tensor::TensorView> = HashMap::new();
@@ -82,7 +84,10 @@ async fn loads_synthetic_model_and_embeds() {
     let q = embedder.embed_query("hello").await.unwrap();
     assert_eq!(q.len(), 8);
     // 相同文本的文档/查询向量一致（同模型同池化）
-    let d = embedder.embed_documents(vec!["hello".into()]).await.unwrap();
+    let d = embedder
+        .embed_documents(vec!["hello".into()])
+        .await
+        .unwrap();
     assert!(q.iter().zip(&d[0]).all(|(a, b)| (a - b).abs() < 1e-6));
 
     let _ = std::fs::remove_dir_all(&dir);

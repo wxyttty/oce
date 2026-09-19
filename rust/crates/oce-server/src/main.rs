@@ -58,11 +58,17 @@ enum Command {
 }
 
 fn default_data_dir_str() -> String {
-    dirs_home().join(".oce").join("data").to_string_lossy().into_owned()
+    dirs_home()
+        .join(".oce")
+        .join("data")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 const PERSONAL_ENV_TEMPLATE: &str = r#"# OpenContextEngine 个人模式配置（Rust 版）
@@ -98,12 +104,25 @@ MILVUS_DENSE_DIM=1024
 
 # ==================== 检索 ====================
 RETRIEVAL_FINAL_SELECT_K=10
+# 规则层文件描述注入（实验开关，默认关；开启触发索引重建提示）
+# RETRIEVAL_FILE_DESC_ENABLED=false
+# related symbols hints 输出层追加（实验开关，默认关）
+# RETRIEVAL_RELATED_SYMBOLS_ENABLED=false
+# rerank 悬崖截断：仅 API 重排通道（已被 LLM 重排取代、默认关）生效
+# RETRIEVAL_RERANK_CUTOFF_ENABLED=false
+# broad mode：架构/概览探索查询宽窗口 regime（实验开关，默认关）
+# RETRIEVAL_BROAD_MODE_ENABLED=false
+# 元目录降权：.github 等 CI 目录 ×0.5，CI 意图查询豁免（实验开关，默认关）
+# RETRIEVAL_META_DIR_PENALTY_ENABLED=false
 
 # ==================== LLM（可选：重排/改写/意图分类） ====================
 LLM_RERANK_ENABLED=true
 LLM_BASE_URL=https://api.siliconflow.cn/v1
 LLM_API_KEY=
 LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+# 换用 Qwen3 等混合思考模型时保持默认（auto）即可：已知提供方自动注入
+# enable_thinking=false，避免思考链烧尽 max_tokens 后返回空 content。
+# LLM_ENABLE_THINKING=auto
 
 # ==================== 监控 ====================
 MONITORING_ENABLED=true
@@ -232,27 +251,26 @@ async fn serve(data_dir: PathBuf, env_file: Option<PathBuf>, host: String, port:
         application: container.application.clone(),
         container: container.clone(),
     };
-    let app = routes::router(state)
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::AllowOrigin::list(
-            parse_cors_origins(&container.settings.cors_origins)
-                .into_iter()
-                .filter_map(|o| o.parse().ok()),
-        ))
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::PATCH,
-                    axum::http::Method::DELETE,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers([
-                    axum::http::header::AUTHORIZATION,
-                    axum::http::header::CONTENT_TYPE,
-                ])
-                .max_age(std::time::Duration::from_secs(600)),
-        );
+    let app = routes::router(state).layer(
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(
+                parse_cors_origins(&container.settings.cors_origins)
+                    .into_iter()
+                    .filter_map(|o| o.parse().ok()),
+            ))
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+            ])
+            .max_age(std::time::Duration::from_secs(600)),
+    );
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -270,7 +288,6 @@ fn parse_cors_origins(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
-
 
 /// `oce doctor`：迁移/排障自检。逐项报告，全部通过才输出 ok。
 fn doctor(data_dir: PathBuf) {
@@ -318,24 +335,24 @@ fn doctor(data_dir: PathBuf) {
             }
         };
         match {
-                let blob_count: i64 = db
-                    .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
-                    .unwrap_or(-1);
-                if blob_count >= 0 {
-                    println!("  [ok] SQLite: {db_path}（blobs={blob_count}，schema 可打开）");
-                    Ok::<(), String>(())
-                } else {
-                    println!("  [fail] SQLite schema 不可用：{db_path}");
-                    failures += 1;
-                    Ok::<(), String>(())
-                }
-            } {
-                Ok(()) => {}
-                Err(e) => {
-                    println!("  [fail] SQLite 检查失败: {e}");
-                    failures += 1;
-                }
+            let blob_count: i64 = db
+                .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+                .unwrap_or(-1);
+            if blob_count >= 0 {
+                println!("  [ok] SQLite: {db_path}（blobs={blob_count}，schema 可打开）");
+                Ok::<(), String>(())
+            } else {
+                println!("  [fail] SQLite schema 不可用：{db_path}");
+                failures += 1;
+                Ok::<(), String>(())
             }
+        } {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  [fail] SQLite 检查失败: {e}");
+                failures += 1;
+            }
+        }
     } else {
         println!("  [info] SQLite 不存在（首次启动自动创建）：{db_path}");
     }
@@ -368,7 +385,9 @@ fn doctor(data_dir: PathBuf) {
                 let msg = format!("{e}");
                 if msg.contains("already opened") || msg.contains("locked") || msg.contains("锁定")
                 {
-                    println!("  [info] TriviumDB 正被运行中的服务持有（写锁），跳过打开检查：{tdb_path}");
+                    println!(
+                        "  [info] TriviumDB 正被运行中的服务持有（写锁），跳过打开检查：{tdb_path}"
+                    );
                 } else {
                     println!("  [fail] TriviumDB 打开失败 {tdb_path}: {e}");
                     failures += 1;
@@ -398,19 +417,17 @@ fn doctor(data_dir: PathBuf) {
         }
     };
     match provider_name {
-        "static" => {
-            match oce_infra::static_embed::StaticEmbedder::load(&settings.embedding) {
-                Ok(e) => println!(
-                    "  [ok] 嵌入提供方 static：{}（dim={}）",
-                    e.model_id(),
-                    e.dim()
-                ),
-                Err(e) => {
-                    println!("  [fail] 静态模型加载失败：{e}");
-                    failures += 1;
-                }
+        "static" => match oce_infra::static_embed::StaticEmbedder::load(&settings.embedding) {
+            Ok(e) => println!(
+                "  [ok] 嵌入提供方 static：{}（dim={}）",
+                e.model_id(),
+                e.dim()
+            ),
+            Err(e) => {
+                println!("  [fail] 静态模型加载失败：{e}");
+                failures += 1;
             }
-        }
+        },
         _ => {
             if settings.embedding.api_key.is_some() {
                 println!("  [ok] 嵌入提供方 openai：EMBED_API_KEY 已配置");

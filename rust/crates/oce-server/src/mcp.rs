@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 /// HOME 目录（与 main.rs 的 serve 默认数据目录同源）。
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// 工具定义（tools/list 载荷）。
@@ -71,8 +73,14 @@ pub async fn handle_message(state: &Option<Arc<WorkspaceIndexer>>, msg: &Value) 
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tool_definitions()),
         "tools/call" => {
-            let name = msg.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+            let name = msg
+                .pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = msg
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(json!({}));
             call_tool(state, name, &args).await
         }
         other => Err((-32601, format!("method not found: {other}"))),
@@ -120,8 +128,7 @@ async fn call_tool(
             }
         }
         "oce_status" => match indexer.status().await {
-            Ok(s) => serde_json::to_value(s)
-                .map_err(|e| e.to_string()),
+            Ok(s) => serde_json::to_value(s).map_err(|e| e.to_string()),
             Err(e) => Err(e.message),
         },
         "oce_reindex" => match indexer.reindex().await {
@@ -171,9 +178,7 @@ pub async fn run_stdio(workspace: PathBuf) -> Result<(), String> {
     // 当前工作区的 blob 名单做 scope，不会串到其它项目的向量。
     let data_dir = std::env::var("OCE_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs_home().join(".oce").join("data")
-        });
+        .unwrap_or_else(|_| dirs_home().join(".oce").join("data"));
 
     // 与 serve 同源加载 data_dir/.env（嵌入模型/凭据等配置不应因接入方式不同而漂移）
     let env_path = data_dir.join(".env");

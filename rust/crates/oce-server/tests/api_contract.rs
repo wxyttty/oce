@@ -37,7 +37,10 @@ impl FakeEmbedder {
 
 #[async_trait::async_trait]
 impl oce_core::search::Embedder for FakeEmbedder {
-    async fn embed_documents(&self, texts: Vec<String>) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
+    async fn embed_documents(
+        &self,
+        texts: Vec<String>,
+    ) -> oce_core::error::OceResult<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.embed(t)).collect())
     }
     async fn embed_query(&self, text: &str) -> oce_core::error::OceResult<Vec<f32>> {
@@ -61,9 +64,12 @@ async fn app(tag: &str) -> Router {
     settings.retrieval.inner.query_decomposition_enabled = false;
     settings.llm.rerank_enabled = false;
     settings.retrieval.inner.query_rewrite_enabled = false;
-    let container = Container::build_with_embedder(settings, Some(std::sync::Arc::new(FakeEmbedder { dim: 8 })))
-        .await
-        .unwrap();
+    let container = Container::build_with_embedder(
+        settings,
+        Some(std::sync::Arc::new(FakeEmbedder { dim: 8 })),
+    )
+    .await
+    .unwrap();
     let state = AppState {
         application: container.application.clone(),
         container,
@@ -72,7 +78,13 @@ async fn app(tag: &str) -> Router {
 }
 
 /// 通过 axum oneshot 调用（server crate 内嵌模块复用路由构建）。
-async fn call(app: Router, method: &str, uri: &str, key: Option<&str>, body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    app: Router,
+    method: &str,
+    uri: &str,
+    key: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match key {
         Some(k) => builder.header("authorization", format!("Bearer {k}")),
@@ -88,7 +100,9 @@ async fn call(app: Router, method: &str, uri: &str, key: Option<&str>, body: Opt
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let json: Value = if bytes.is_empty() {
         Value::Null
     } else {
@@ -119,17 +133,38 @@ async fn health_and_version_public() {
 async fn auth_required_with_fastapi_error_shape() {
     let router = app("auth").await;
     // 无 key → 401 + OpenAI 风格 error 体
-    let (status, body) = call(router.clone(), "POST", "/find-missing", None, Some(json!({}))).await;
+    let (status, body) = call(
+        router.clone(),
+        "POST",
+        "/find-missing",
+        None,
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_api_key");
 
     // 错误 key → 401
-    let (status, _) = call(router.clone(), "POST", "/find-missing", Some("wrong"), Some(json!({}))).await;
+    let (status, _) = call(
+        router.clone(),
+        "POST",
+        "/find-missing",
+        Some("wrong"),
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // 正确 key（默认 sk-opencontextengine）→ 200
-    let (status, body) = call(router, "POST", "/find-missing", Some("sk-opencontextengine"), Some(json!({"mem_object_names": ["x"]}))).await;
+    let (status, body) = call(
+        router,
+        "POST",
+        "/find-missing",
+        Some("sk-opencontextengine"),
+        Some(json!({"mem_object_names": ["x"]})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["unknown_memory_names"].is_array());
     assert!(body["nonindexed_blob_names"].is_array());
@@ -178,7 +213,10 @@ async fn batch_upload_and_retrieval_contract() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    assert!(body["formatted_retrieval"].as_str().unwrap().contains("The following code sections were retrieved:"));
+    assert!(body["formatted_retrieval"]
+        .as_str()
+        .unwrap()
+        .contains("The following code sections were retrieved:"));
     assert!(body["codebase_retrieval_elapsed_ms"].is_i64());
 
     // retrieval 无 scope → 400 SCOPE_REQUIRED
@@ -224,7 +262,14 @@ async fn admin_endpoints_auth_and_crud() {
     let admin_key = "sk-opencontextengine"; // ADMIN_API_KEY 空回落 API_KEY
 
     // 数据面 key 不等于 admin 语义分离——此处同一 key（回落），应放行
-    let (status, body) = call(router.clone(), "GET", "/admin/credentials", Some(admin_key), None).await;
+    let (status, body) = call(
+        router.clone(),
+        "GET",
+        "/admin/credentials",
+        Some(admin_key),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["credentials"].is_array());
 
@@ -290,16 +335,37 @@ async fn admin_endpoints_auth_and_crud() {
     assert_eq!(body["kind"], "rerank");
 
     // 删除
-    let (status, _) = call(router.clone(), "DELETE", &format!("/admin/credentials/{cred_id}"), Some(admin_key), None).await;
+    let (status, _) = call(
+        router.clone(),
+        "DELETE",
+        &format!("/admin/credentials/{cred_id}"),
+        Some(admin_key),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // GC
-    let (status, body) = call(router.clone(), "POST", "/admin/gc", Some(admin_key), Some(json!({"ttl_days": 30, "dry_run": true}))).await;
+    let (status, body) = call(
+        router.clone(),
+        "POST",
+        "/admin/gc",
+        Some(admin_key),
+        Some(json!({"ttl_days": 30, "dry_run": true})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["dry_run"], true);
 
     // stats
-    let (status, body) = call(router.clone(), "GET", "/admin/stats?window_hours=24", Some(admin_key), None).await;
+    let (status, body) = call(
+        router.clone(),
+        "GET",
+        "/admin/stats?window_hours=24",
+        Some(admin_key),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["window_hours"], 24);
 
@@ -314,7 +380,10 @@ async fn admin_endpoints_auth_and_crud() {
     ] {
         let (status, body) = call(router.clone(), "GET", path, Some(admin_key), None).await;
         assert_eq!(status, StatusCode::OK, "path={path} body={body}");
-        assert!(body.get(shape_key).is_some(), "path={path} missing {shape_key}");
+        assert!(
+            body.get(shape_key).is_some(),
+            "path={path} missing {shape_key}"
+        );
     }
     // 明细端点
     for path in [
@@ -326,10 +395,24 @@ async fn admin_endpoints_auth_and_crud() {
         assert!(body.get("items").is_some(), "path={path} missing items");
     }
     // 非法 bucket → 422
-    let (status, _) = call(router.clone(), "GET", "/admin/reports/api-calls?bucket=week", Some(admin_key), None).await;
+    let (status, _) = call(
+        router.clone(),
+        "GET",
+        "/admin/reports/api-calls?bucket=week",
+        Some(admin_key),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     // 报表需 admin key（错误 key → 401；ADMIN_API_KEY 空时回落 API_KEY，
     // 所以正确 API_KEY 也能过——与 Python 版语义一致）
-    let (status, _) = call(router, "GET", "/admin/reports/api-calls", Some("wrong-key"), None).await;
+    let (status, _) = call(
+        router,
+        "GET",
+        "/admin/reports/api-calls",
+        Some("wrong-key"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
