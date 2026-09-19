@@ -89,6 +89,9 @@ class CredentialConfiguredEmbedder:
             await delegate.close()
 
     def _build_delegate(self, config: EmbeddingRuntimeConfig) -> OpenAIEmbedder:
+        # query_instruction + instruction_template 只作用于查询侧：
+        # 始终取 env/settings 层配置（与 Rust credentials.rs 一致），
+        # DB 凭据行不携带指令语义。
         return OpenAIEmbedder.from_endpoint(
             endpoint=config.endpoint,
             api_key=config.api_key,
@@ -103,6 +106,8 @@ class CredentialConfiguredEmbedder:
             proxy=config.proxy,
             credential_id=config.credential_id,
             on_usage=self._on_usage,
+            query_instruction=self._fallback.query_instruction,
+            instruction_template=self._fallback.instruction_template,
         )
 
     async def _resolve_config(self) -> EmbeddingRuntimeConfig:

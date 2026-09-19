@@ -28,6 +28,7 @@ class OpenAIEmbedder:
         credential_id: int = 0,
         on_usage: UsageCallback | None = None,
         query_instruction: str = "",
+        instruction_template: str = "none",
     ) -> None:
         if max_batch_size < 1 or max_concurrency < 1:
             raise ValueError("Embedding batch size and concurrency must be positive")
@@ -46,6 +47,7 @@ class OpenAIEmbedder:
         self._credential_id = credential_id
         self._on_usage = on_usage
         self._query_instruction = query_instruction
+        self._instruction_template = instruction_template
 
     @classmethod
     def from_endpoint(
@@ -65,6 +67,7 @@ class OpenAIEmbedder:
         on_usage: UsageCallback | None = None,
         proxy: str | None = None,
         query_instruction: str = "",
+        instruction_template: str = "none",
         **_: object,
     ) -> "OpenAIEmbedder":
         base_url = endpoint.rstrip("/")
@@ -72,7 +75,10 @@ class OpenAIEmbedder:
             base_url = base_url[: -len("/embeddings")]
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            limits=httpx.Limits(max_connections=max_concurrency * 2),
+            limits=httpx.Limits(
+                max_connections=max_concurrency * 2,
+                max_keepalive_connections=0,
+            ),
             proxy=proxy,
         )
         client = AsyncOpenAI(
@@ -93,6 +99,7 @@ class OpenAIEmbedder:
             credential_id=credential_id,
             on_usage=on_usage,
             query_instruction=query_instruction,
+            instruction_template=instruction_template,
         )
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -113,9 +120,14 @@ class OpenAIEmbedder:
         return vectors
 
     async def embed_query(self, text: str) -> list[float]:
-        # 添加 query instruction（如果配置了）
+        # 添加 query instruction（如果配置了）。
+        # Qwen3-Embedding / F2LLM-v2 官方格式：Instruct: {task}\nQuery: {query}；
+        # 文档侧不加 instruction（embed_documents 不注入）。
         if self._query_instruction:
-            text = self._query_instruction + text
+            if self._instruction_template == "instruct_query":
+                text = f"Instruct: {self._query_instruction}\nQuery: {text}"
+            else:
+                text = self._query_instruction + text
         return (await self.embed_documents([text]))[0]
 
     async def _embed_segments(self, texts: list[str]) -> list[list[float]]:

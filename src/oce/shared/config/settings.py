@@ -97,8 +97,13 @@ class EmbeddingSettings(BaseSettings):
     timeout_seconds: float = Field(default=60.0, gt=0, description="请求超时秒数")
     proxy: str | None = Field(default=None, description="可选 HTTP 代理")
     query_instruction: str = Field(
-        default="",
-        description="Query-side instruction（添加到 query 前，为空则不添加）",
+        default="Given a code retrieval query, retrieve the most relevant code snippets or files that directly implement, explain, or help answer the query.",
+        description="Query-side instruction（Instruct 模板下拼为 Instruct: {instruction}\nQuery: {query}，为空则不添加）",
+    )
+    # 指令模板：none = 裸拼接 {instruction}{query}；instruct_query = Instruct: {}\nQuery: {}
+    instruction_template: str = Field(
+        default="instruct_query",
+        description="Query instruction 模板格式：none | instruct_query",
     )
 
 
