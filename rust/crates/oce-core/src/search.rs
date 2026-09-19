@@ -57,6 +57,18 @@ pub trait ExactSearchStore: Send + Sync {
         allowed_blob_names: Option<&[String]>,
         top_k: usize,
     ) -> OceResult<Vec<SearchHit>>;
+
+    /// 查标识符在 scope 内的定义位置（related symbols hints 用）。
+    /// 返回按 (identifier, kind=endpoint 优先) 排序的定义列表，含 fanout
+    /// （该标识符定义出现的文件数，门控通用符号）。默认返回空（端口可选实现）。
+    async fn find_definitions(
+        &self,
+        identifiers: &[String],
+        allowed_blob_names: Option<&[String]>,
+    ) -> OceResult<Vec<crate::related::SymbolDefinition>> {
+        let _ = (identifiers, allowed_blob_names);
+        Ok(vec![])
+    }
 }
 
 /// 路径搜索结果（文件名查询专用索引）。
@@ -128,19 +140,35 @@ pub trait Embedder: Send + Sync {
     async fn embed_query(&self, text: &str) -> OceResult<Vec<f32>>;
 }
 
-/// 重排器协议（对应 Python `Reranker`）。
-#[async_trait]
-pub trait Reranker: Send + Sync {
-    async fn rerank(&self, query: &str, hits: Vec<SearchHit>) -> OceResult<Vec<SearchHit>>;
+/// API 重排结果：打分命中与未打分候选分离。
+///
+/// 悬崖截断（retrieval.rs，RETRIEVAL_RERANK_CUTOFF_ENABLED）依赖这个边界：
+/// 只有 `ranked` 携带端点校准分（通常 0..1、按相关性降序），`unscored` 的
+/// 分数仍是融合分——两者混在同一列表里无法判分数悬崖。
+#[derive(Debug, Clone)]
+pub struct RerankOutcome {
+    /// 被端点打分的命中，按相关性降序；score 为端点校准分。
+    pub ranked: Vec<SearchHit>,
+    /// 未被端点返回的候选，保持原序与融合分数（select 层的完整候选池）。
+    pub unscored: Vec<SearchHit>,
 }
 
-/// 不重排（原样返回）。
+/// 重排器协议（对应 Python `Reranker`；返回值扩展出打分边界）。
+#[async_trait]
+pub trait Reranker: Send + Sync {
+    async fn rerank(&self, query: &str, hits: Vec<SearchHit>) -> OceResult<RerankOutcome>;
+}
+
+/// 不重排（全部作为未打分候选原样返回：无分数信号，不触发截断）。
 pub struct NoopReranker;
 
 #[async_trait]
 impl Reranker for NoopReranker {
-    async fn rerank(&self, _query: &str, hits: Vec<SearchHit>) -> OceResult<Vec<SearchHit>> {
-        Ok(hits)
+    async fn rerank(&self, _query: &str, hits: Vec<SearchHit>) -> OceResult<RerankOutcome> {
+        Ok(RerankOutcome {
+            ranked: vec![],
+            unscored: hits,
+        })
     }
 }
 
@@ -174,6 +202,14 @@ pub struct RetrievalAudit {
     pub path_boosted: bool,
     pub scope_size: Option<usize>,
     pub stages: std::collections::HashMap<String, u64>,
+    /// 语义通路缺席（嵌入冷却/故障）：formatter 据此注入 degraded 提示
+    pub semantic_degraded: bool,
+    /// 最终命中头部分数低于阈值：formatter 据此注入 weak 提示
+    pub weak_match: bool,
+    /// broad regime 已生效（formatter 据此注入骨架化提示）
+    pub broad: bool,
+    /// related symbols hints（输出层追加；空 = 未开启或无可用定义）
+    pub related_symbols: Vec<crate::related::RelatedSymbol>,
 }
 
 impl RetrievalAudit {

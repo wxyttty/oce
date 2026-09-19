@@ -94,18 +94,32 @@ fn walk_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> {
     let mut stack = vec![root.to_path_buf()];
     let mut seen = HashSet::new();
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             if out.len() >= limit {
                 return out;
             }
             let path = entry.path();
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if path.is_dir() {
                 if matches!(
                     name.as_str(),
-                    ".git" | "node_modules" | "target" | "dist" | "build" | "__pycache__"
-                        | ".venv" | "venv" | ".pytest_cache" | "vendor" | "coverage"
+                    ".git"
+                        | "node_modules"
+                        | "target"
+                        | "dist"
+                        | "build"
+                        | "__pycache__"
+                        | ".venv"
+                        | "venv"
+                        | ".pytest_cache"
+                        | "vendor"
+                        | "coverage"
                 ) {
                     continue;
                 }
@@ -113,19 +127,51 @@ fn walk_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> {
                 continue;
             }
             // 只取常见文本源码/文档扩展
-            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
             let keep = matches!(
                 ext.as_str(),
-                "py" | "rs" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "c" | "h" | "cpp"
-                    | "hpp" | "cs" | "rb" | "php" | "kt" | "swift" | "scala" | "md" | "rst"
-                    | "txt" | "toml" | "yaml" | "yml" | "json" | "sql" | "sh" | "vue" | "html"
-                    | "css" | "jsp" | "tag"
+                "py" | "rs"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "go"
+                    | "java"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "hpp"
+                    | "cs"
+                    | "rb"
+                    | "php"
+                    | "kt"
+                    | "swift"
+                    | "scala"
+                    | "md"
+                    | "rst"
+                    | "txt"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "json"
+                    | "sql"
+                    | "sh"
+                    | "vue"
+                    | "html"
+                    | "css"
+                    | "jsp"
+                    | "tag"
             ) || name == "Dockerfile"
                 || name == "Makefile";
             if !keep {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             if content.contains('\0') {
                 continue;
             }
@@ -143,7 +189,10 @@ fn walk_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> {
     out
 }
 
-fn chunk_dir(root: &Path, limit: usize) -> (Vec<(String, Vec<oce_core::chunk::Chunk>)>, usize, f64) {
+fn chunk_dir(
+    root: &Path,
+    limit: usize,
+) -> (Vec<(String, Vec<oce_core::chunk::Chunk>)>, usize, f64) {
     let router = oce_core::chunk::build_chunker().expect("chunker");
     let files = walk_files(root, limit);
     let mut results = Vec::with_capacity(files.len());
@@ -157,8 +206,7 @@ fn chunk_dir(root: &Path, limit: usize) -> (Vec<(String, Vec<oce_core::chunk::Ch
         results.push((rel.to_string_lossy().into_owned(), chunks));
     }
     let elapsed = start.elapsed().as_secs_f64();
-    (results, total_chars, elapsed)
-    .pipe(|r| {
+    (results, total_chars, elapsed).pipe(|r| {
         println!(
             "files={} chunks={} chars={} chunk_time={:.1}ms throughput={:.0} Kchars/s",
             files.len(),
@@ -244,7 +292,8 @@ async fn main() {
                     storage_mode: "rom".into(),
                     dense_dim: dim,
                     auto_build_quiver: false,
-            text_hybrid: true,
+                    text_hybrid: true,
+                                        text_boost: 0.8,
                     expand_depth: 0,
                 })
                 .expect("open tdb"),
@@ -294,14 +343,24 @@ async fn main() {
                 ms(chunk_elapsed),
                 chars as f64 / 1024.0 / chunk_elapsed
             );
-            println!("embed  {:>8.1} ms   (fake, {total_chunks} chunks)", ms(embed_elapsed));
+            println!(
+                "embed  {:>8.1} ms   (fake, {total_chunks} chunks)",
+                ms(embed_elapsed)
+            );
             println!(
                 "tdb    {:>8.1} ms   ({:.0} upserts/s)",
                 ms(write_elapsed),
                 total_chunks as f64 / write_elapsed
             );
-            println!("sqlite {:>8.1} ms   (blobs+chunks+symbols)", ms(sql_elapsed));
-            println!("total  {:>8.1} ms   nodes={}", ms(total_elapsed), tdb.node_count());
+            println!(
+                "sqlite {:>8.1} ms   (blobs+chunks+symbols)",
+                ms(sql_elapsed)
+            );
+            println!(
+                "total  {:>8.1} ms   nodes={}",
+                ms(total_elapsed),
+                tdb.node_count()
+            );
             let _ = std::fs::remove_dir_all(db_path.parent().unwrap());
         }
         Command::Query { dir, n, dim } => {
@@ -314,7 +373,8 @@ async fn main() {
                     storage_mode: "rom".into(),
                     dense_dim: dim,
                     auto_build_quiver: false,
-            text_hybrid: true,
+                    text_hybrid: true,
+                                        text_boost: 0.8,
                     expand_depth: 0,
                 })
                 .expect("open tdb"),
@@ -324,7 +384,10 @@ async fn main() {
                 let blob_name = oce_app::service::compute_blob_name(rel, &format!("{rel}"));
                 for chunk in chunks {
                     upserts.push(oce_core::search::VectorUpsert {
-                        chunk_id: format!("{blob_name}-{}-{}-{}", chunk.content_hash, chunk.start_line, chunk.end_line),
+                        chunk_id: format!(
+                            "{blob_name}-{}-{}-{}",
+                            chunk.content_hash, chunk.start_line, chunk.end_line
+                        ),
                         content_hash: chunk.content_hash.clone(),
                         blob_name: blob_name.clone(),
                         content: chunk.content.clone(),
@@ -345,16 +408,23 @@ async fn main() {
             // 查询：每次都 embed + search（scope = 全部 blob）
             let queries: Vec<String> = results
                 .iter()
-                .filter_map(|(_, chunks)| chunks.first().map(|c| c.content.chars().take(60).collect()))
+                .filter_map(|(_, chunks)| {
+                    chunks.first().map(|c| c.content.chars().take(60).collect())
+                })
                 .take(n)
                 .collect();
             let start = Instant::now();
             let mut hit_count = 0usize;
             for q in &queries {
                 let qv = fake_embed(q, dim);
-                
+
                 let hits = oce_core::search::SearchStore::search(
-                    tdb.as_ref(), q, &qv, Some(&blobs), 50, 0.0,
+                    tdb.as_ref(),
+                    q,
+                    &qv,
+                    Some(&blobs),
+                    50,
+                    0.0,
                 )
                 .await
                 .unwrap();
@@ -373,7 +443,6 @@ async fn main() {
         }
     }
 }
-
 
 /// 合成向量：确定性伪随机单位向量。
 fn synthetic_vector(seed: usize, dim: usize) -> Vec<f32> {
@@ -409,7 +478,8 @@ async fn quiver_bench(nodes: usize, dim: usize, n: usize) {
             dense_dim: dim,
             auto_build_quiver: true,
             text_hybrid: true, // ≥1 万节点时查询自动构建 QuIVer ANN
-                    expand_depth: 0,
+            text_boost: 0.8,
+            expand_depth: 0,
         })
         .expect("open tdb"),
     );
@@ -436,7 +506,9 @@ async fn quiver_bench(nodes: usize, dim: usize, n: usize) {
         nodes as f64 / index_elapsed
     );
 
-    let queries: Vec<Vec<f32>> = (0..n).map(|i| synthetic_vector(nodes / 2 + i, dim)).collect();
+    let queries: Vec<Vec<f32>> = (0..n)
+        .map(|i| synthetic_vector(nodes / 2 + i, dim))
+        .collect();
 
     // 预热：首次查询触发 QuIVer 构建，单独计时
     let build_start = Instant::now();
@@ -501,8 +573,8 @@ async fn quiver_bench(nodes: usize, dim: usize, n: usize) {
 fn static_embed_bench(model: &str, n: usize) {
     let mut settings = oce_infra::settings::EmbeddingSettings::from_env();
     settings.static_model = Some(model.to_string());
-    let embedder = oce_infra::static_embed::StaticEmbedder::load(&settings)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let embedder =
+        oce_infra::static_embed::StaticEmbedder::load(&settings).unwrap_or_else(|e| panic!("{e}"));
     let texts: Vec<String> = (0..n)
         .map(|i| {
             format!(

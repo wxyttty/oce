@@ -26,10 +26,8 @@ fn split_on_boundaries(query: &str) -> Vec<&str> {
     let bytes = query.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;
-    let is_break = |b: u8| {
-        b == b'!' || b == b'?' || b == b';'
-            || matches!(bytes_get_context(b), true)
-    };
+    let is_break =
+        |b: u8| b == b'!' || b == b'?' || b == b';' || matches!(bytes_get_context(b), true);
     let _ = is_break;
     while i < bytes.len() {
         let b = bytes[i];
@@ -120,8 +118,7 @@ impl QueryPlanner for HeuristicQueryPlanner {
         }
 
         let mut facets: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         seen.insert(normalized.to_lowercase());
         for raw in split_on_boundaries(query) {
             let stripped = bullet_re().replace(raw, "");
@@ -153,7 +150,10 @@ mod tests {
     #[test]
     fn single_sentence_returns_normalized() {
         let p = HeuristicQueryPlanner::new(4, 8).unwrap();
-        assert_eq!(p.plan("  how does   auth work? "), vec!["how does auth work?"]);
+        assert_eq!(
+            p.plan("  how does   auth work? "),
+            vec!["how does auth work?"]
+        );
     }
 
     #[test]
@@ -161,7 +161,10 @@ mod tests {
         let p = HeuristicQueryPlanner::new(4, 8).unwrap();
         let out = p.plan("How does auth work. Where is the token refresh. Short");
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], "How does auth work. Where is the token refresh. Short");
+        assert_eq!(
+            out[0],
+            "How does auth work. Where is the token refresh. Short"
+        );
         assert_eq!(out[1], "How does auth work");
         assert_eq!(out[2], "Where is the token refresh");
     }

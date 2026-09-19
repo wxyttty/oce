@@ -8,14 +8,23 @@
 
 /// 概念短语 → 代码词汇别名。中英双语条目；匹配大小写不敏感。
 const CONCEPT_ALIASES: &[(&str, &str)] = &[
-    ("错误处理", "try catch exception throw raise error handler logger"),
-    ("error handling", "try catch exception throw raise errorhandler"),
+    (
+        "错误处理",
+        "try catch exception throw raise error handler logger",
+    ),
+    (
+        "error handling",
+        "try catch exception throw raise errorhandler",
+    ),
     ("异常", "exception throw catch panic"),
     ("重试", "retry backoff attempts max_retries"),
     ("重连", "reconnect retry backoff"),
     ("超时", "timeout deadline elapsed expire"),
     ("日志", "log logger logging tracing debug"),
-    ("鉴权", "auth authentication authorization token session login jwt"),
+    (
+        "鉴权",
+        "auth authentication authorization token session login jwt",
+    ),
     ("权限", "permission role access control acl"),
     ("配置", "config configuration settings options env"),
     ("数据库", "database db sql query migration pool transaction"),
@@ -83,9 +92,7 @@ pub fn enrich_lexical_query(query: &str) -> String {
         }
         for token in tokens.split_whitespace() {
             // token 已出现在原查询（大小写不敏感）则不重复
-            if !lower.split_whitespace().any(|w| w == token)
-                && !extra.contains(&token)
-            {
+            if !lower.split_whitespace().any(|w| w == token) && !extra.contains(&token) {
                 extra.push(token);
             }
         }
@@ -117,6 +124,9 @@ mod tests {
 
     #[test]
     fn no_alias_no_change() {
-        assert_eq!(enrich_lexical_query("proxyPackageQty 在哪里定义"), "proxyPackageQty 在哪里定义");
+        assert_eq!(
+            enrich_lexical_query("proxyPackageQty 在哪里定义"),
+            "proxyPackageQty 在哪里定义"
+        );
     }
 }

@@ -8,23 +8,28 @@
 //!
 //! 本 crate 只依赖纯逻辑；I/O（存储、HTTP、LLM）全部经 trait 注入。
 
+pub mod blob;
+pub mod broad;
+pub mod chain;
 pub mod chunk;
 pub mod classifier;
+pub mod cooldown;
 pub mod error;
+pub mod file_desc;
 pub mod formatter;
+pub mod indexing;
 pub mod lexical;
+pub mod metrics;
 pub mod path_doc;
 pub mod planner;
 pub mod priority;
+pub mod related;
 pub mod retrieval;
 pub mod retrieval_settings;
 pub mod search;
 pub mod selector;
-pub mod blob;
-pub mod chain;
-pub mod indexing;
-pub mod metrics;
 pub mod source_filter;
+pub mod span_merge;
 pub mod strategy;
 pub mod symbol;
 

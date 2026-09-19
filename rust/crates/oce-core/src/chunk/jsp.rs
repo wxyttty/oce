@@ -23,7 +23,10 @@ pub struct JspChunker {
 }
 
 impl JspChunker {
-    pub fn new(fallback: std::sync::Arc<dyn Chunker>, max_chunk_chars: usize) -> Result<Self, String> {
+    pub fn new(
+        fallback: std::sync::Arc<dyn Chunker>,
+        max_chunk_chars: usize,
+    ) -> Result<Self, String> {
         if max_chunk_chars == 0 {
             return Err("max_chunk_chars 必须 > 0".into());
         }
@@ -35,15 +38,22 @@ impl JspChunker {
 
     /// 掩码内嵌 Java：`<%...%>` 与 `<jsp:scriptlet|expression|declaration>...</jsp:...>`
     /// 的 body 换成等长空白（换行保留）。
+    /// regex crate 不支持回溯引用（`(?P=kind)` 构造即 panic，clippy invalid_regex
+    /// 已 deny），三种 kind 展开为独立正则逐个掩码，语义等价。
     fn mask_jsp_code(content: &str) -> String {
         static JSP_BLOCK: OnceLock<Regex> = OnceLock::new();
-        static JSP_XML: OnceLock<Regex> = OnceLock::new();
+        static JSP_XML: OnceLock<Vec<Regex>> = OnceLock::new();
         let block = JSP_BLOCK.get_or_init(|| Regex::new(r"(?s)<%.*?%>").unwrap());
         let xml = JSP_XML.get_or_init(|| {
-            Regex::new(
-                r"(?is)(?P<open><jsp:(?P<kind>scriptlet|expression|declaration)\b[^>]*>)(?P<body>.*?)(?P<close></jsp:(?P=kind)\s*>)",
-            )
-            .unwrap()
+            ["scriptlet", "expression", "declaration"]
+                .iter()
+                .map(|kind| {
+                    Regex::new(&format!(
+                        r"(?is)(<jsp:{kind}\b[^>]*>)(.*?)(</jsp:{kind}\s*>)"
+                    ))
+                    .unwrap()
+                })
+                .collect()
         });
         let blank = |s: &str| {
             s.chars()
@@ -51,10 +61,15 @@ impl JspChunker {
                 .collect::<String>()
         };
         let masked = block.replace_all(content, |c: &regex::Captures| blank(&c[0]));
-        xml.replace_all(&masked, |c: &regex::Captures| {
-            format!("{}{}{}", &c["open"], blank(&c["body"]), &c["close"])
-        })
-        .into_owned()
+        let mut out = masked.into_owned();
+        for xml_re in xml {
+            out = xml_re
+                .replace_all(&out, |c: &regex::Captures| {
+                    format!("{}{}{}", &c[1], blank(&c[2]), &c[3])
+                })
+                .into_owned();
+        }
+        out
     }
 
     /// 顶层内容边界：(起始行, 标签名)。
@@ -70,8 +85,7 @@ impl JspChunker {
             .filter(|c| CONTENT_NODE_TYPES.contains(&c.kind()))
             .collect();
         if top_level.len() == 1
-            && tag_name(top_level[0], source)
-                .is_some_and(|t| t == "html" || t == "jsp:root")
+            && tag_name(top_level[0], source).is_some_and(|t| t == "html" || t == "jsp:root")
         {
             let nested = direct_content_children(top_level[0], source);
             if nested.len() > 1 {
@@ -81,12 +95,7 @@ impl JspChunker {
         as_boundaries(top_level, source)
     }
 
-    fn emit(
-        &self,
-        boundaries: Vec<(u32, String)>,
-        lines: &[&str],
-        path: &str,
-    ) -> Vec<Chunk> {
+    fn emit(&self, boundaries: Vec<(u32, String)>, lines: &[&str], path: &str) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         for (index, (boundary_start, tag)) in boundaries.iter().enumerate() {
             let start = if index == 0 { 1 } else { *boundary_start };
@@ -96,9 +105,7 @@ impl JspChunker {
                 lines.len() as u32
             };
             end = trim_trailing_blank_lines(lines, start, end);
-            for (span_start, span_end, text) in
-                cap_span(lines, start, end, self.max_chunk_chars)
-            {
+            for (span_start, span_end, text) in cap_span(lines, start, end, self.max_chunk_chars) {
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -118,7 +125,11 @@ impl JspChunker {
     }
 }
 
-fn find_element<'a>(node: tree_sitter::Node<'a>, tag: &str, source: &'a [u8]) -> Option<tree_sitter::Node<'a>> {
+fn find_element<'a>(
+    node: tree_sitter::Node<'a>,
+    tag: &str,
+    source: &'a [u8],
+) -> Option<tree_sitter::Node<'a>> {
     if CONTENT_NODE_TYPES.contains(&node.kind()) && tag_name(node, source).as_deref() == Some(tag) {
         return Some(node);
     }
@@ -131,10 +142,7 @@ fn find_element<'a>(node: tree_sitter::Node<'a>, tag: &str, source: &'a [u8]) ->
     None
 }
 
-fn direct_content_children(
-    node: tree_sitter::Node,
-    source: &[u8],
-) -> Vec<(u32, String)> {
+fn direct_content_children(node: tree_sitter::Node, source: &[u8]) -> Vec<(u32, String)> {
     let children: Vec<tree_sitter::Node> = node
         .children(&mut node.walk())
         .filter(|c| CONTENT_NODE_TYPES.contains(&c.kind()))
@@ -160,15 +168,11 @@ fn tag_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     let mut pending: Vec<tree_sitter::Node> = node.children(&mut node.walk()).collect();
     while let Some(current) = pending.pop() {
         if current.kind() == "tag_name" {
-            return Some(
-                String::from_utf8_lossy(&source[current.byte_range()])
-                    .to_lowercase(),
-            );
+            return Some(String::from_utf8_lossy(&source[current.byte_range()]).to_lowercase());
         }
         if current.kind() == "start_tag" || current.kind() == "self_closing_tag" {
             // Python 版 pop(0) + extend 前插：BFS；此处保持一致
-            let children: Vec<tree_sitter::Node> =
-                current.children(&mut current.walk()).collect();
+            let children: Vec<tree_sitter::Node> = current.children(&mut current.walk()).collect();
             pending.splice(0..0, children);
         }
     }
@@ -192,12 +196,40 @@ impl Chunker for JspChunker {
                 .ok()?;
             let masked = Self::mask_jsp_code(content);
             let tree = parser.parse(&masked, None)?;
-            Some(Self::content_boundaries(tree.root_node(), masked.as_bytes()))
+            Some(Self::content_boundaries(
+                tree.root_node(),
+                masked.as_bytes(),
+            ))
         })()
         .unwrap_or_default();
         if boundaries.is_empty() {
             return self.fallback.chunk(content, path);
         }
         self.emit(boundaries, &lines, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：mask_jsp_code 曾经用回溯引用（(?P=kind)）构造正则——regex crate
+    /// 不支持，首个 .jsp 文件切块即 panic。
+    #[test]
+    fn masks_jsp_code_blocks_without_panicking() {
+        let src = "<html>\n<body>\n<% int x = 1; %>\n<jsp:scriptlet>\n  int y = 2;\n</jsp:scriptlet>\n<jsp:expression>x + y</jsp:expression>\n<p>hi</p>\n</body>\n</html>\n";
+        let masked = super::JspChunker::mask_jsp_code(src);
+        assert!(masked.contains("<jsp:scriptlet>"));
+        assert!(masked.contains("</jsp:scriptlet>"));
+        assert!(
+            !masked.contains("int y = 2;"),
+            "scriptlet body must be blanked"
+        );
+        assert!(!masked.contains("x + y"), "expression body must be blanked");
+        assert!(masked.contains("<jsp:expression>"), "expression tags kept");
+        assert!(!masked.contains("int x = 1;"));
+        assert!(masked.contains("<p>hi</p>"));
+        // 行数守恒（掩码保留换行）
+        assert_eq!(masked.lines().count(), src.lines().count());
     }
 }

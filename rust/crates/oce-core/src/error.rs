@@ -4,8 +4,6 @@
 //! `InvalidCheckpointToken` → 400，`NeedsReset` → 404，`ServiceNotReady` → 503，
 //! `ScopeRequired` → 400。`Display` 输出 `[CODE] message`，与 Python `OCEError.__str__` 一致。
 
-
-
 #[derive(Debug, thiserror::Error)]
 #[error("[{code}] {message}")]
 pub struct OceError {
@@ -36,8 +34,7 @@ impl OceError {
     /// 服务未就绪：无可用的 embedding 凭据（HTTP 503 + Retry-After: 0）。
     pub fn service_not_ready(reason: Option<&str>) -> Self {
         Self::new(
-            reason
-                .unwrap_or("Service not ready: no embedding credential is configured"),
+            reason.unwrap_or("Service not ready: no embedding credential is configured"),
             "SERVICE_NOT_READY",
         )
     }

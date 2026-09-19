@@ -32,7 +32,10 @@ fn section_tag_re() -> &'static Regex {
 }
 
 impl VueChunker {
-    pub fn new(fallback: std::sync::Arc<dyn Chunker>, max_chunk_chars: usize) -> Result<Self, String> {
+    pub fn new(
+        fallback: std::sync::Arc<dyn Chunker>,
+        max_chunk_chars: usize,
+    ) -> Result<Self, String> {
         if max_chunk_chars == 0 {
             return Err("max_chunk_chars 必须 > 0".into());
         }
@@ -57,8 +60,11 @@ impl VueChunker {
 
     /// 定位完整的顶层 SFC 块（1-based 闭区间行）。未闭合块 → ValueError → fallback。
     fn locate_sections(content: &str) -> Result<Vec<Section>, ()> {
-        let newline_offsets: Vec<usize> =
-            content.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i).collect();
+        let newline_offsets: Vec<usize> = content
+            .char_indices()
+            .filter(|(_, c)| *c == '\n')
+            .map(|(i, _)| i)
+            .collect();
         let mut sections: Vec<Section> = Vec::new();
         let mut active_tag: Option<String> = None;
         let mut active_start = 0usize;
@@ -145,7 +151,8 @@ impl VueChunker {
         let styles: Vec<&Section> = sections.iter().filter(|(t, _, _)| t == "style").collect();
         let primary: Vec<&Section> = sections.iter().filter(|(t, _, _)| t != "style").collect();
 
-        let mut groups: Vec<(u32, u32, String)> = self.primary_groups(&primary, &styles, lines, language);
+        let mut groups: Vec<(u32, u32, String)> =
+            self.primary_groups(&primary, &styles, lines, language);
         groups.extend(styles.iter().map(|(_, s, e)| (*s, *e, "style".to_string())));
         groups.sort_by_key(|g| g.0);
 
@@ -186,9 +193,7 @@ impl VueChunker {
         }
         let start = primary.iter().map(|(_, s, _)| *s).min().unwrap();
         let end = primary.iter().map(|(_, _, e)| *e).max().unwrap();
-        let crosses_style = styles
-            .iter()
-            .any(|(_, ss, se)| *ss <= end && *se >= start);
+        let crosses_style = styles.iter().any(|(_, ss, se)| *ss <= end && *se >= start);
         let tags: std::collections::HashSet<&str> =
             primary.iter().map(|(t, _, _)| t.as_str()).collect();
         let combined_type = if tags.len() == 1 {

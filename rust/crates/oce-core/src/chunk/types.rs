@@ -84,7 +84,8 @@ impl Chunk {
         self.end_line - self.start_line + 1
     }
 
-    /// 嵌入输入文本（与 Python `LocatedChunk.embedding_text` 一致）。
+    /// 嵌入输入文本（与 Python `LocatedChunk.embedding_text` 一致；
+    /// 描述注入由索引管线 embedding_text(c, desc) 负责，bench 假嵌入沿用无描述格式）。
     pub fn embedding_text(&self) -> String {
         format!("File: {}\n\n{}", self.path, self.content)
     }

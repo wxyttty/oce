@@ -40,6 +40,26 @@ pub struct RetrievalSettings {
     pub path_boost_weight: f32,
     /// 是否启用查询意图分类（LLM-based）
     pub intent_classification_enabled: bool,
+    /// 是否启用 related symbols hints（输出层追加，不动排序；默认关）
+    pub related_symbols_enabled: bool,
+    /// rerank 悬崖截断（RETRIEVAL_RERANK_CUTOFF_ENABLED，默认关）：仅作用于
+    /// API rerank（已被 LLM 重排取代、默认关）的端点校准分——head×0.35 /
+    /// 绝对下限 0.10 双线，最少保留 6 条。LLM 重排只返回顺序无校准分，
+    /// 其截断语义由 prompt 的 "output fewer — do not pad" 天然承担。
+    pub rerank_cutoff_enabled: bool,
+    /// broad regime（RETRIEVAL_BROAD_MODE_ENABLED，默认关）：架构/概览探索查询
+    /// 的宽窗口（20 hits / per-path 2）+ manifest prior + 长摘录骨架化。
+    /// 触发 = LLM intent Overview ∨ 启发式架构词表（见 `broad` 模块）。
+    pub broad_mode_enabled: bool,
+    /// 元目录降权（RETRIEVAL_META_DIR_PENALTY_ENABLED，默认关）：.github 等
+    /// CI/模板基础设施目录 ×0.5，查询点名 CI/工作流时豁免。仅主检索路生效，
+    /// 路径增强路保持文档中立。
+    pub meta_dir_penalty_enabled: bool,
+    /// 相邻 span 合并 + 小片段补全（RETRIEVAL_SPAN_MERGE_ENABLED，默认关）：
+    /// 同文件相距 ≤2 行的选中片段合并成连续段、<6 行片段两侧各补 3 行，
+    /// 内容从 chunk 行重构（缺行回退原样）；select 池加宽 8 条供合并缩窗
+    /// 后回填（semble M1）。
+    pub span_merge_enabled: bool,
 }
 
 impl Default for RetrievalSettings {
@@ -67,6 +87,11 @@ impl Default for RetrievalSettings {
             query_rewrite_enabled: false,
             path_boost_weight: 0.5,
             intent_classification_enabled: true,
+            related_symbols_enabled: false,
+            rerank_cutoff_enabled: false,
+            broad_mode_enabled: false,
+            meta_dir_penalty_enabled: false,
+            span_merge_enabled: false,
         }
     }
 }

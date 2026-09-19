@@ -10,10 +10,10 @@
 //! - start_index：strip 后文本在原文中的偏移（等价 langchain 的 `text.find`）
 //! - 最终 chunk 由起始行 tile 成连续不重叠行区间，块间无重叠
 
-use async_trait::async_trait;
 use super::lang::detect_language;
 use super::spans::{cap_span, char_len, trim_trailing_blank_lines};
 use super::types::Chunk;
+use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -33,45 +33,110 @@ pub fn is_meaningful(text: &str) -> bool {
 /// 只收录 Python 版 RecursiveChunker 实际路由到的语言；其余走默认分隔符。
 fn language_separators(lang: &str) -> Option<&'static [&'static str]> {
     Some(match lang {
-        "python" => &[
-            "\nclass ", "\ndef ", "\n\tdef ", "\n\n", "\n", " ", "",
-        ][..],
+        "python" => &["\nclass ", "\ndef ", "\n\tdef ", "\n\n", "\n", " ", ""][..],
         "javascript" | "jsx" => &[
-            "\nfunction ", "\nconst ", "\nlet ", "\nvar ", "\nclass ", "\nif ",
-            "\nfor ", "\nwhile ", "\nswitch ", "\ncase ", "\ndefault ",
-            "\n\n", "\n", " ", "",
+            "\nfunction ",
+            "\nconst ",
+            "\nlet ",
+            "\nvar ",
+            "\nclass ",
+            "\nif ",
+            "\nfor ",
+            "\nwhile ",
+            "\nswitch ",
+            "\ncase ",
+            "\ndefault ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "typescript" | "tsx" => &[
-            "\nenum ", "\ninterface ", "\nnamespace ", "\ntype ", "\nclass ",
-            "\nfunction ", "\nconst ", "\nlet ", "\nvar ", "\nif ", "\nfor ",
-            "\nwhile ", "\nswitch ", "\ncase ", "\ndefault ", "\n\n", "\n", " ", "",
+            "\nenum ",
+            "\ninterface ",
+            "\nnamespace ",
+            "\ntype ",
+            "\nclass ",
+            "\nfunction ",
+            "\nconst ",
+            "\nlet ",
+            "\nvar ",
+            "\nif ",
+            "\nfor ",
+            "\nwhile ",
+            "\nswitch ",
+            "\ncase ",
+            "\ndefault ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "java" => &[
-            "\nclass ", "\npublic ", "\nprotected ", "\nprivate ", "\nstatic ",
-            "\nif ", "\nfor ", "\nwhile ", "\nswitch ", "\ncase ",
-            "\n\n", "\n", " ", "",
+            "\nclass ",
+            "\npublic ",
+            "\nprotected ",
+            "\nprivate ",
+            "\nstatic ",
+            "\nif ",
+            "\nfor ",
+            "\nwhile ",
+            "\nswitch ",
+            "\ncase ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "cpp" => &[
-            "\nclass ", "\nvoid ", "\nint ", "\nfloat ", "\ndouble ", "\nif ",
-            "\nfor ", "\nwhile ", "\nswitch ", "\ncase ", "\n\n", "\n", " ", "",
+            "\nclass ",
+            "\nvoid ",
+            "\nint ",
+            "\nfloat ",
+            "\ndouble ",
+            "\nif ",
+            "\nfor ",
+            "\nwhile ",
+            "\nswitch ",
+            "\ncase ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "go" => &[
-            "\nfunc ", "\nvar ", "\nconst ", "\ntype ", "\nif ", "\nfor ",
-            "\nswitch ", "\ncase ", "\n\n", "\n", " ", "",
+            "\nfunc ",
+            "\nvar ",
+            "\nconst ",
+            "\ntype ",
+            "\nif ",
+            "\nfor ",
+            "\nswitch ",
+            "\ncase ",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "rust" => &[
-            "\nfn ", "\nconst ", "\nlet ", "\nif ", "\nwhile ", "\nfor ",
-            "\nloop ", "\nmatch ", "\nconst ", "\n\n", "\n", " ", "",
+            "\nfn ", "\nconst ", "\nlet ", "\nif ", "\nwhile ", "\nfor ", "\nloop ", "\nmatch ",
+            "\nconst ", "\n\n", "\n", " ", "",
         ][..],
         "markdown" => &[
-            "\n#{1,6} ", "```\n", "\n\\*\\*\\*+\n", "\n---+\n", "\n___+\n",
-            "\n\n", "\n", " ", "",
+            "\n#{1,6} ",
+            "```\n",
+            "\n\\*\\*\\*+\n",
+            "\n---+\n",
+            "\n___+\n",
+            "\n\n",
+            "\n",
+            " ",
+            "",
         ][..],
         "html" => &[
-            "<body", "<div", "<p", "<br", "<li", "<h1", "<h2", "<h3", "<h4",
-            "<h5", "<h6", "<span", "<table", "<tr", "<td", "<th", "<ul", "<ol",
-            "<header", "<footer", "<nav", "<head", "<style", "<script",
-            "<meta", "<title", "",
+            "<body", "<div", "<p", "<br", "<li", "<h1", "<h2", "<h3", "<h4", "<h5", "<h6", "<span",
+            "<table", "<tr", "<td", "<th", "<ul", "<ol", "<header", "<footer", "<nav", "<head",
+            "<style", "<script", "<meta", "<title", "",
         ][..],
         _ => return None,
     })
@@ -224,7 +289,10 @@ impl RecursiveChunker {
     /// 把片段起始偏移映射到 1-based 行号；行中落点回拉到所属行行首。
     fn start_lines(&self, lines: &[&str], pieces: &[Piece]) -> Vec<u32> {
         let offsets = line_offsets(lines);
-        pieces.iter().map(|(off, _)| line_of(&offsets, *off as u64)).collect()
+        pieces
+            .iter()
+            .map(|(off, _)| line_of(&offsets, *off as u64))
+            .collect()
     }
 
     /// 起始行 → 连续、不重叠的行区间。块间重叠在此丢弃：两个声明相同行的
@@ -337,7 +405,11 @@ fn split_with_separator(text: &str, separator: &str, is_regex: bool, base: usize
         pieces.push((base, text[..occ[0].0].to_string()));
     }
     for i in 0..occ.len() {
-        let end = if i + 1 < occ.len() { occ[i + 1].0 } else { text.len() };
+        let end = if i + 1 < occ.len() {
+            occ[i + 1].0
+        } else {
+            text.len()
+        };
         let seg = &text[occ[i].0..end];
         if !seg.is_empty() {
             pieces.push((base + occ[i].0, seg.to_string()));
@@ -354,8 +426,17 @@ fn regex_for(pattern: &str) -> &'static Regex {
     let table = TABLE.get_or_init(|| {
         let mut m: HashMap<&'static str, Regex> = HashMap::new();
         for lang in [
-            "python", "javascript", "jsx", "typescript", "tsx", "java", "cpp",
-            "go", "rust", "markdown", "html",
+            "python",
+            "javascript",
+            "jsx",
+            "typescript",
+            "tsx",
+            "java",
+            "cpp",
+            "go",
+            "rust",
+            "markdown",
+            "html",
         ] {
             if let Some(seps) = language_separators(lang) {
                 for s in seps {
@@ -367,12 +448,17 @@ fn regex_for(pattern: &str) -> &'static Regex {
         }
         m
     });
-    table.get(pattern).unwrap_or_else(|| panic!("unregistered regex separator: {pattern}"))
+    table
+        .get(pattern)
+        .unwrap_or_else(|| panic!("unregistered regex separator: {pattern}"))
 }
 
 /// Python `str.splitlines()` 语义（不保留行尾）。
 pub fn split_lines(content: &str) -> Vec<&str> {
-    content.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect()
+    content
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect()
 }
 
 /// 每行首字符的字节偏移。
@@ -446,7 +532,10 @@ mod tests {
         // 行区间文本逐字对齐
         let all: Vec<&str> = split_lines(content);
         for chunk in &chunks {
-            assert_eq!(chunk.content, all[chunk.start_line as usize - 1..chunk.end_line as usize].join("\n"));
+            assert_eq!(
+                chunk.content,
+                all[chunk.start_line as usize - 1..chunk.end_line as usize].join("\n")
+            );
         }
     }
 

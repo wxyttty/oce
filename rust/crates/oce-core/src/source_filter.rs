@@ -1,22 +1,56 @@
 //! 索引准入规则。与 Python `domain/services/source_filter.py` 对齐。
 
-
-const IGNORED_DIRECTORY_NAMES: [&str; 29] = [
-    ".cache", ".eggs", ".git", ".gradle", ".hg", ".idea", ".mypy_cache", ".next", ".nuxt",
-    ".output", ".pytest_cache", ".ruff_cache", ".svelte-kit", ".svn", ".tox", ".turbo",
-    ".venv", ".vscode", "bower_components", "build", "coverage", "dist", "generated",
-    "node_modules", "site-packages", "target", "vendor", "venv", "__pycache__",
+/// 编辑器/AI 工具私有目录（借鉴 BCE toolDirSkip）：settings.local.json、规则文件、
+/// 缓存等内容在 config 类查询上得分虚高，却从不是有用的检索上下文。
+const IGNORED_DIRECTORY_NAMES: [&str; 37] = [
+    ".cache",
+    ".claude",
+    ".cursor",
+    ".eggs",
+    ".fleet",
+    ".git",
+    ".gradle",
+    ".hg",
+    ".idea",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".pytest_cache",
+    ".roo",
+    ".ruff_cache",
+    ".svelte-kit",
+    ".svn",
+    ".tox",
+    ".trae",
+    ".turbo",
+    ".venv",
+    ".vs",
+    ".vscode",
+    ".windsurf",
+    ".zed",
+    "bower_components",
+    "build",
+    "coverage",
+    "dist",
+    "generated",
+    "node_modules",
+    "site-packages",
+    "target",
+    "vendor",
+    "venv",
+    "__pycache__",
 ];
 
 fn ignored_file_suffixes() -> &'static [&'static str] {
     &[
-        ".min.js", ".min.css", ".map", ".lock", ".log", ".tmp", ".bak", ".swp", ".jsonl",
-        ".csv", ".tsv", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".icns", ".webp",
-        ".tiff", ".svg", ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg", ".webm",
-        ".mkv", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".pdf", ".doc", ".docx", ".xls",
-        ".xlsx", ".ppt", ".pptx", ".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".bz2",
-        ".xz", ".pyc", ".pyo", ".class", ".o", ".obj", ".a", ".so", ".dll", ".dylib",
-        ".exe", ".bin", ".wasm", ".sqlite", ".db",
+        ".min.js", ".min.css", ".map", ".lock", ".log", ".tmp", ".bak", ".swp", ".jsonl", ".csv",
+        ".tsv", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".icns", ".webp", ".tiff", ".svg",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg", ".webm", ".mkv", ".woff",
+        ".woff2", ".ttf", ".otf", ".eot", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt",
+        ".pptx", ".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".bz2", ".xz", ".pyc", ".pyo",
+        ".class", ".o", ".obj", ".a", ".so", ".dll", ".dylib", ".exe", ".bin", ".wasm", ".sqlite",
+        ".db",
     ]
 }
 
@@ -27,7 +61,8 @@ pub fn is_ignored_source_path(path: &str) -> bool {
     if parts.len() > 1 {
         for part in &parts[..parts.len() - 1] {
             // dist-prod / dist-dev 等 Vue 构建产物变体目录实测会稀释检索质量
-            let is_dist_variant = *part == "dist" || part.starts_with("dist-") || part.starts_with("dist.");
+            let is_dist_variant =
+                *part == "dist" || part.starts_with("dist-") || part.starts_with("dist.");
             if IGNORED_DIRECTORY_NAMES.contains(part)
                 || is_dist_variant
                 || part.ends_with(".egg-info")
@@ -37,7 +72,9 @@ pub fn is_ignored_source_path(path: &str) -> bool {
             }
         }
     }
-    ignored_file_suffixes().iter().any(|s| normalized.ends_with(s))
+    ignored_file_suffixes()
+        .iter()
+        .any(|s| normalized.ends_with(s))
 }
 
 /// 与 Git 相同的低成本二进制信号：NUL 字节。
@@ -58,6 +95,20 @@ mod tests {
     }
 
     #[test]
+    fn ignores_ai_tool_dirs() {
+        // AI/编辑器工具私有目录：settings.local.json、规则文件、缓存
+        // 在 config 类查询上得分虚高，却不是有用的检索上下文
+        assert!(is_ignored_source_path(".claude/settings.local.json"));
+        assert!(is_ignored_source_path(".cursor/rules/code-style.mdc"));
+        assert!(is_ignored_source_path(".windsurf/memories/global.md"));
+        assert!(is_ignored_source_path(".trae/rules/project_rules.md"));
+        assert!(is_ignored_source_path(".roo/rules/.rooignore"));
+        assert!(is_ignored_source_path(".zed/settings.json"));
+        assert!(is_ignored_source_path(".fleet/settings.json"));
+        assert!(is_ignored_source_path(".vs/tasks.vs.json"));
+    }
+
+    #[test]
     fn allows_source() {
         assert!(!is_ignored_source_path("src/main.rs"));
         assert!(!is_ignored_source_path("README.md"));
@@ -66,7 +117,9 @@ mod tests {
     #[test]
     fn ignores_dist_variants() {
         // Vue 构建产物变体（dist-prod / dist.dev）实测混入索引稀释结果
-        assert!(is_ignored_source_path("jcfx-admin/dist-prod/assets/app.css"));
+        assert!(is_ignored_source_path(
+            "jcfx-admin/dist-prod/assets/app.css"
+        ));
         assert!(is_ignored_source_path("dist.dev/x.js"));
         assert!(!is_ignored_source_path("src/distribution/main.rs")); // 非构建目录不误伤
     }

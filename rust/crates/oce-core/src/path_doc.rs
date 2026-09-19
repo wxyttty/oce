@@ -12,8 +12,6 @@ fn token_split_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"[/\\._\-]+").unwrap())
 }
 
-
-
 fn extension_semantics() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -123,8 +121,8 @@ pub fn is_indexable_path(path: &str) -> bool {
         ".venv/",
     ];
     const EXCLUDE_EXTENSIONS: [&str; 17] = [
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot",
-        ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".dylib",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".zip",
+        ".tar", ".gz", ".exe", ".dll", ".so", ".dylib",
     ];
     for pattern in EXCLUDE_PATTERNS {
         if path.contains(pattern) {

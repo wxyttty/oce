@@ -69,6 +69,10 @@ pub struct RetrievalStrategy {
     pub boost_definitions: bool,
     pub boost_docs: bool,
     pub max_chunks_per_path: usize,
+    /// broad regime（架构/概览类探索查询：宽窗口 + manifest prior + 骨架化）。
+    /// 触发是「意图判为 Overview ∨ 启发式词表」的 OR 之一，启发式在 pipeline 里
+    /// 独立判定（无 LLM 分类时的 fallback，词表见 `broad::query_wants_structure`）。
+    pub broad: bool,
 }
 
 const fn strategy(
@@ -86,6 +90,7 @@ const fn strategy(
         boost_definitions,
         boost_docs,
         max_chunks_per_path,
+        broad: false,
     }
 }
 
@@ -102,8 +107,11 @@ pub fn get_strategy(intent: LlmIntent) -> RetrievalStrategy {
         LlmIntent::Path => strategy(true, true, true, false, false, 2),
         // F：功能描述需要跨中英文术语召回，再由正文相关性确定实现文件
         LlmIntent::Feature => strategy(false, true, true, false, false, 3),
-        // O：文档提升 + LLM 重排（理解架构描述）
-        LlmIntent::Overview => strategy(false, false, true, false, true, 3),
+        // O：文档提升 + LLM 重排（理解架构描述）+ broad regime（答案散布多文件）
+        LlmIntent::Overview => RetrievalStrategy {
+            broad: true,
+            ..strategy(false, false, true, false, true, 3)
+        },
         // M：查询改写 + LLM 重排（处理多条件）
         LlmIntent::Compound => strategy(false, true, true, false, false, 3),
     }

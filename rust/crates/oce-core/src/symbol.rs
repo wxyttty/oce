@@ -68,11 +68,7 @@ pub struct SymbolExtractor;
 impl SymbolExtractor {
     /// 从 chunk content 提取所有标识符（按 (identifier, kind) 去重；
     /// endpoint 不被 definition 覆盖）。
-    pub fn extract_symbols(
-        content: &str,
-        start_line: u32,
-        end_line: u32,
-    ) -> Vec<SymbolOccurrence> {
+    pub fn extract_symbols(content: &str, start_line: u32, end_line: u32) -> Vec<SymbolOccurrence> {
         let mut symbols: Vec<SymbolOccurrence> = Vec::new();
         let mut seen: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
@@ -121,12 +117,12 @@ impl SymbolExtractor {
         static BACKTICK: OnceLock<Regex> = OnceLock::new();
         static SNAKE: OnceLock<Regex> = OnceLock::new();
         static PASCAL: OnceLock<Regex> = OnceLock::new();
-        let backtick =
-            BACKTICK.get_or_init(|| Regex::new(r"`([A-Za-z_][A-Za-z0-9_:]*)`").unwrap());
-        let snake =
-            SNAKE.get_or_init(|| Regex::new(r"\b([a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)*)\b").unwrap());
-        let pascal =
-            PASCAL.get_or_init(|| Regex::new(r"\b([A-Z][A-Za-z0-9]*(?:::[A-Z][A-Za-z0-9]*)*)\b").unwrap());
+        let backtick = BACKTICK.get_or_init(|| Regex::new(r"`([A-Za-z_][A-Za-z0-9_:]*)`").unwrap());
+        let snake = SNAKE
+            .get_or_init(|| Regex::new(r"\b([a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)*)\b").unwrap());
+        let pascal = PASCAL.get_or_init(|| {
+            Regex::new(r"\b([A-Z][A-Za-z0-9]*(?:::[A-Z][A-Za-z0-9]*)*)\b").unwrap()
+        });
 
         for caps in backtick.captures_iter(query) {
             identifiers.insert(caps[1].to_string());
@@ -184,6 +180,9 @@ mod tests {
         let syms = SymbolExtractor::extract_symbols(content, 1, 3);
         let y = syms.iter().find(|s| s.identifier == "create_y").unwrap();
         assert_eq!(y.kind, "endpoint");
-        assert_eq!(syms.iter().filter(|s| s.identifier == "create_y").count(), 1);
+        assert_eq!(
+            syms.iter().filter(|s| s.identifier == "create_y").count(),
+            1
+        );
     }
 }

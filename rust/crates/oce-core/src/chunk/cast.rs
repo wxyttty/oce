@@ -30,12 +30,15 @@ const MIN_NWS_DENSITY: f64 = 0.67;
 const INTACT_NODE_SIZE_FACTOR: usize = 3;
 
 /// 声明体字段名（tree-sitter grammars 的负载字段）。
-const DECLARATION_BODY_FIELDS: [&str; 4] =
-    ["body", "block", "declaration_list", "field_declaration_list"];
+const DECLARATION_BODY_FIELDS: [&str; 4] = [
+    "body",
+    "block",
+    "declaration_list",
+    "field_declaration_list",
+];
 
 /// 以子节点类型表达结构的后缀约定（Kotlin 等不命名子节点的语法）。
-const BODY_NODE_SUFFIXES: [&str; 4] =
-    ["_body", "_block", "_statements", "_declaration_list"];
+const BODY_NODE_SUFFIXES: [&str; 4] = ["_body", "_block", "_statements", "_declaration_list"];
 
 const BODY_NODE_TYPES: [&str; 3] = ["block", "statements", "statement_block"];
 
@@ -65,8 +68,7 @@ const REACT_DECLARATION_TYPES: [&str; 4] = [
     "lexical_declaration",
     "variable_declaration",
 ];
-const JSX_NODE_TYPES: [&str; 3] =
-    ["jsx_element", "jsx_fragment", "jsx_self_closing_element"];
+const JSX_NODE_TYPES: [&str; 3] = ["jsx_element", "jsx_fragment", "jsx_self_closing_element"];
 
 /// 语言 → tree-sitter 语言标识（与 astchunk_builder.LANGUAGE_MAP 对齐的子集：
 /// Rust 侧有成熟 grammar crate 的语言；其余语言由 RecursiveChunker 兜底，
@@ -168,11 +170,9 @@ impl TreeArena {
             if let Some(f) = node.child_by_field_name(field) {
                 // field 子节点也在 children 里；找它的下标
                 let fb = f.byte_range();
-                self.nodes[idx].field_child[fi] =
-                    children_idx.iter().copied().find(|&c| {
-                        self.nodes[c].start_byte == fb.start
-                            && self.nodes[c].end_byte == fb.end
-                    });
+                self.nodes[idx].field_child[fi] = children_idx.iter().copied().find(|&c| {
+                    self.nodes[c].start_byte == fb.start && self.nodes[c].end_byte == fb.end
+                });
             }
         }
         self.nodes[idx].children = children_idx;
@@ -277,7 +277,9 @@ impl CastBuilder {
             )
             .unwrap()
         });
-        let text = String::from_utf8_lossy(&arena.source[arena.nodes[node].start_byte..arena.nodes[node].end_byte]);
+        let text = String::from_utf8_lossy(
+            &arena.source[arena.nodes[node].start_byte..arena.nodes[node].end_byte],
+        );
         let first_line = text.lines().next().unwrap_or("");
         re.is_match(first_line.trim_start())
     }
@@ -414,8 +416,7 @@ impl CastBuilder {
     }
 
     fn looks_like_body(kind: &str) -> bool {
-        BODY_NODE_TYPES.contains(&kind)
-            || BODY_NODE_SUFFIXES.iter().any(|s| kind.ends_with(s))
+        BODY_NODE_TYPES.contains(&kind) || BODY_NODE_SUFFIXES.iter().any(|s| kind.ends_with(s))
     }
 
     /// 兄弟窗口贪心合并：合并后不超预算才并（保持 AST 结构）。
@@ -424,8 +425,8 @@ impl CastBuilder {
         let mut merged: Vec<Vec<AstNode>> = Vec::new();
         for window in ast_windows {
             if let Some(last) = merged.last_mut() {
-                let total: usize =
-                    last.iter().map(|n| n.size).sum::<usize>() + window.iter().map(|n| n.size).sum::<usize>();
+                let total: usize = last.iter().map(|n| n.size).sum::<usize>()
+                    + window.iter().map(|n| n.size).sum::<usize>();
                 if total <= self.max_chunk_size {
                     last.extend(window);
                     continue;
@@ -523,11 +524,7 @@ impl CastChunker {
     }
 
     /// astchunk 的 0-based 行 → 1-based 闭区间。节点止于行首列 0 时该行归下个 chunk。
-    fn resolve_range(
-        &self,
-        raw: &RawChunk,
-        lines: &[&str],
-    ) -> Result<(u32, u32), ()> {
+    fn resolve_range(&self, raw: &RawChunk, lines: &[&str]) -> Result<(u32, u32), ()> {
         let line_count = lines.len();
         let start = raw.start_line as u32 + 1;
         let end = if raw.end_column == 0 && raw.end_line as u32 + 1 > start {
@@ -587,9 +584,7 @@ impl CastChunker {
         }
         let mut chunks = Vec::new();
         for (start, end, chunk_type) in self.merge_small(ranges, &lines) {
-            for (span_start, span_end, text) in
-                cap_span(&lines, start, end, self.max_chunk_chars)
-            {
+            for (span_start, span_end, text) in cap_span(&lines, start, end, self.max_chunk_chars) {
                 if let Ok(chunk) = Chunk::new(
                     Chunk::compute_hash(&text),
                     path,
@@ -630,9 +625,7 @@ pub fn cast_languages() -> &'static std::collections::HashSet<&'static str> {
         super::lang::supported_languages()
             .iter()
             .copied()
-            .filter(|l| {
-                *l != "markdown" && *l != "jsp" && *l != "vue" && *l != "svelte"
-            })
+            .filter(|l| *l != "markdown" && *l != "jsp" && *l != "vue" && *l != "svelte")
             .filter(|l| tree_sitter_language(l).is_some())
             .collect()
     })
@@ -653,9 +646,7 @@ impl Chunker for CastChunker {
         }
         // 语言由 router 保证已知；防御性再检测一次
         match detect_language(path) {
-            Some(lang) if cast_languages().contains(lang) => {
-                self.chunk_ast(content, path, lang)
-            }
+            Some(lang) if cast_languages().contains(lang) => self.chunk_ast(content, path, lang),
             _ => self.fallback.chunk(content, path),
         }
     }

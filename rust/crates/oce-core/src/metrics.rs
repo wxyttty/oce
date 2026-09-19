@@ -70,7 +70,12 @@ pub struct RetrievalMetricRecord {
 impl RetrievalMetricRecord {
     /// 从 audit 构造（字段缺失时 None，与 Python 落库行为一致）。
     /// query_text 默认不落原文（隐私安全）；调用方按 store_query_text 配置覆写。
-    pub fn from_audit(audit: &RetrievalAudit, source: &str, hit_count: usize, total_ms: i64) -> Self {
+    pub fn from_audit(
+        audit: &RetrievalAudit,
+        source: &str,
+        hit_count: usize,
+        total_ms: i64,
+    ) -> Self {
         let stage = |name: &str| audit.stages.get(name).map(|v| *v as i64);
         Self {
             source: source.to_string(),
