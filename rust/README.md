@@ -309,5 +309,9 @@ OCE_PG_URL="postgres://oce:oce@localhost:25432/oce"   cargo test -p oce-infra --
 4. ✅ 集成测试 + 基准
 5. ✅ 服务模式：PostgreSQL 元数据（sqlx）+ Redis 队列 + 向量后端
    （trivium 默认 / pgvector 可选；端口抽象 Phase 0 完成）
-6. ⬜ 性能跟进：QuIVer 大库基准（≥1 万节点）、pgvector vs TriviumDB 检索质量 A/B
+6. ✅ pgvector vs TriviumDB 检索质量 A/B（nollm 档，Qwen3-8B API 嵌入）：
+   双仓合计 154.3 vs 156.6（差 2.3 分，噪声带边缘）——质量持平，pgvector 达到
+   服务模式可用标准；默认仍 trivium（零依赖），pgvector 为 PG 一体化一等选项。
+   详见 oce-benchmark/results/ab-pgvector-vs-trivium-nollm.md
+   ⬜ QuIVer 大库基准（≥1 万节点）
 7. ⬜ 数据迁移工具：Python 版 .env / db 文件兼容说明

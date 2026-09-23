@@ -898,6 +898,11 @@ impl RetrievalPipeline {
                         std::iter::once(query).chain(queries_to_search.iter().map(String::as_str))
                     {
                         let Ok(query_vector) = self.embedder.embed_query(variant).await else {
+                            // 与 dense 路同语义：trip 必须留痕，否则持续故障期全程静默、
+                            // 生产排查只能看到"检索变慢/变差"却无失败日志
+                            tracing::warn!(
+                                "embed_query failed (path index); semantic recall paused {COOLDOWN:?}"
+                            );
                             self.cooldowns.embed.trip(COOLDOWN);
                             break;
                         };
