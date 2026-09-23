@@ -155,6 +155,49 @@ pub trait Embedder: Send + Sync {
     async fn embed_query(&self, text: &str) -> OceResult<Vec<f32>>;
 }
 
+/// 查询嵌入缓存装饰器：相同 query 的向量直接命中，跳过 API 往返
+/// （查询延迟的大头是 embed API ~400ms；MCP/交互场景重复查询常见）。
+/// 文档嵌入不缓存（内容寻址、几乎不重复）。容量上限 FIFO 淘汰，
+/// 失败结果不缓存（瞬时故障不应被记忆）。
+pub struct CachedEmbedder {
+    inner: std::sync::Arc<dyn Embedder>,
+    cache: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>>,
+    capacity: usize,
+}
+
+impl CachedEmbedder {
+    pub fn new(inner: std::sync::Arc<dyn Embedder>, capacity: usize) -> Self {
+        Self {
+            inner,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity: capacity.max(16),
+        }
+    }
+}
+
+#[async_trait]
+impl Embedder for CachedEmbedder {
+    async fn embed_documents(&self, texts: Vec<String>) -> OceResult<Vec<Vec<f32>>> {
+        self.inner.embed_documents(texts).await
+    }
+
+    async fn embed_query(&self, text: &str) -> OceResult<Vec<f32>> {
+        if let Some(v) = self.cache.lock().unwrap().get(text) {
+            return Ok(v.as_ref().clone());
+        }
+        let vec = self.inner.embed_query(text).await?;
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= self.capacity {
+            // FIFO 淘汰一个任意键（HashMap 无序，等价随机）
+            if let Some(k) = cache.keys().next().cloned() {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(text.to_string(), std::sync::Arc::new(vec.clone()));
+        Ok(vec)
+    }
+}
+
 /// API 重排结果：打分命中与未打分候选分离。
 ///
 /// 悬崖截断（retrieval.rs，RETRIEVAL_RERANK_CUTOFF_ENABLED）依赖这个边界：

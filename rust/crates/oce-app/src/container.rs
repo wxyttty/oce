@@ -606,8 +606,16 @@ impl Container {
         let credential_admin = credential_store.clone();
 
         // ── 向量化提供方解析（维度在打开 TriviumDB 前确定） ──
-        let (embedder, vector_dim, embed_runtime, provider_name, model_tag) =
+        let (raw_embedder, vector_dim, embed_runtime, provider_name, model_tag) =
             resolve_embed_provider(&settings, &credential_store, embedder_override).await?;
+        // 查询嵌入缓存：查询延迟大头是 embed API 往返（~400ms），
+        // 交互/MCP 场景重复查询常见。文档嵌入不缓存（内容寻址）。
+        // 静态嵌入（本地推理，无网络往返）无需缓存。
+        let embedder: Arc<dyn oce_core::search::Embedder> = if provider_name == "static" {
+            raw_embedder
+        } else {
+            Arc::new(oce_core::search::CachedEmbedder::new(raw_embedder, 512))
+        };
         // etext 版本化 embedding_text 格式（v2 = 含规则层文件描述注入）。
         let etext_version: &str = if settings.retrieval.file_desc_enabled {
             "etext=v2"
