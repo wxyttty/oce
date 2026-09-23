@@ -80,6 +80,16 @@ pub trait BlobRepository: Send + Sync {
     }
     /// 标记 chunk 已嵌入（按 content_hash）。
     async fn mark_embedded(&self, content_hashes: &[String]) -> OceResult<()>;
+    /// 全部 blob 名（工作区嵌入式模式的删除/重建用）。
+    async fn find_all_blob_names(&self) -> OceResult<Vec<String>>;
+    /// 全部 pending blob 名。队列对账要全集，且只需要标识不需要聚合。
+    async fn list_pending_names(&self) -> OceResult<Vec<String>>;
+    /// 查有 staging 但长时间未处理的 pending blob（requeue-stale 用）。
+    async fn find_stale_with_staging(
+        &self,
+        stale_hours: i64,
+        limit: usize,
+    ) -> OceResult<Vec<String>>;
 }
 
 /// 嵌入开关端口（对应 Python settings.embedding.enabled 的运行时读取）。
@@ -465,4 +475,33 @@ fn embedding_text(chunk: &LocatedChunk, description: Option<&str>) -> String {
 /// 判定内容是否可切块（re-export 便捷用）。
 pub fn content_meaningful(content: &str) -> bool {
     is_meaningful(content)
+}
+
+/// `_classify` 的 blob 状态分类（find_missing / blob-status 共用）。
+/// 依赖仅限 BlobRepository 端口方法，放 core 供 SQLite/PG 实现共享。
+pub async fn classify_blob_status(
+    repo: &dyn BlobRepository,
+    blob_names: Vec<String>,
+) -> OceResult<(Vec<String>, Vec<String>)> {
+    if blob_names.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let exists = repo.exists_many(&blob_names).await?;
+    let unknown: Vec<String> = blob_names
+        .iter()
+        .filter(|n| !exists.get(*n).copied().unwrap_or(false))
+        .cloned()
+        .collect();
+    let existing: Vec<String> = blob_names
+        .iter()
+        .filter(|n| exists.get(*n).copied().unwrap_or(false))
+        .cloned()
+        .collect();
+    let blobs = repo.get_many(&existing).await?;
+    let nonindexed: Vec<String> = existing
+        .iter()
+        .filter(|n| blobs.get(*n).map(|b| !b.is_ready()).unwrap_or(true))
+        .cloned()
+        .collect();
+    Ok((unknown, nonindexed))
 }

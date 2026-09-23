@@ -129,6 +129,21 @@ pub trait VectorIndex: Send + Sync {
     async fn delete(&self, blob_names: &[String]) -> OceResult<()>;
 }
 
+/// 向量引擎统计端口（storage 报表 / workspace 状态用；只读旁路）。
+pub trait VectorStatsSource: Send + Sync {
+    /// 引擎内节点总数（chunk + path）。
+    fn node_count(&self) -> usize;
+    /// 按 kind 的节点统计（[("chunk", n), ("path", m)]）。
+    fn kind_stats(&self) -> Vec<(String, usize)>;
+}
+
+/// 向量引擎：检索 + 写路径 + 路径索引 + 统计（组合端口；容器单句柄装配四个角色）。
+/// TriviumDB/pgvector 实现均满足；Qdrant 等远程后端接入时同样实现全部四个。
+pub trait VectorEngine:
+    SearchStore + VectorIndex + PathSearchStore + VectorStatsSource
+{
+}
+
 /// 嵌入器协议（对应 Python `Embedder`）。
 /// 约束：embed_documents 与 embed_query 必须同 model + 同维度。
 #[async_trait]

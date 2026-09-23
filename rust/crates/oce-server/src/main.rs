@@ -8,7 +8,6 @@ use oce_server::routes;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "oce", version, about = "OpenContextEngine (Rust edition)")]
@@ -19,11 +18,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 在数据目录生成个人模式 .env（零配置起步）
+    /// 在数据目录生成 .env（零配置起步；--service 生成服务模式模板）
     Init {
         /// 数据目录（默认 ~/.oce/data）
         #[arg(long, default_value_t = default_data_dir_str())]
         data_dir: String,
+        /// 生成服务模式模板（PostgreSQL + Redis + worker）
+        #[arg(long)]
+        service: bool,
     },
     /// 启动嵌入式 MCP 服务器（单进程直连引擎，无需后台服务）
     Mcp {
@@ -128,12 +130,63 @@ LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
 MONITORING_ENABLED=true
 "#;
 
+/// 服务模式模板：PostgreSQL 元数据 + Redis 队列 + 后台 worker。
+/// 与个人模式的差异项：DB_URL / REDIS_URL / WORKER_ENABLED=true / TRIVIUM_PATH 必填。
+const SERVICE_ENV_TEMPLATE: &str = r#"# OpenContextEngine 服务模式配置（Rust 版）
+# 依赖：PostgreSQL 14+（docker compose up -d postgres）+ Redis 7
+
+# ==================== 鉴权 ====================
+API_KEY=sk-opencontextengine
+ADMIN_API_KEY=
+
+# ==================== 元数据（PostgreSQL） ====================
+# 空库自动建表（幂等）；已有 Python 版建的库可直接挂载
+DB_URL=postgresql+asyncpg://oce:oce@localhost:25432/oce
+DB_POOL_SIZE=10
+
+# ==================== 向量引擎 ====================
+# 后端选择：trivium（默认，单文件，挂载卷即可）| pgvector（向量入 PG，一体化）
+# VECTOR_BACKEND=trivium
+# trivium 后端：服务模式必须显式指定路径（无 SQLite 同目录推导）
+TRIVIUM_PATH=/var/lib/oce/oce.tdb
+MILVUS_DENSE_DIM=1024
+# TRIVIUM_SYNC_MODE=normal
+# TRIVIUM_STORAGE_MODE=rom
+
+# ==================== 嵌入 ====================
+EMBED_PROVIDER=auto
+EMBED_ENABLED=true
+EMBED_ENDPOINT=https://api.siliconflow.cn/v1/embeddings
+EMBED_API_KEY=
+EMBED_MODEL=Qwen/Qwen3-Embedding-4B
+EMBED_DIMENSIONS=1024
+
+# ==================== 任务队列（Redis）+ Worker ====================
+REDIS_URL=redis://localhost:26379/0
+REDIS_QUEUE_NAME=oce:embed_queue
+WORKER_ENABLED=true
+WORKER_CONCURRENCY=2
+WORKER_MAX_RETRIES=3
+
+# ==================== 检索 ====================
+RETRIEVAL_FINAL_SELECT_K=10
+
+# ==================== LLM（可选：重排/改写/意图分类） ====================
+LLM_RERANK_ENABLED=true
+LLM_BASE_URL=https://api.siliconflow.cn/v1
+LLM_API_KEY=
+LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+
+# ==================== 监控 ====================
+MONITORING_ENABLED=true
+"#;
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { data_dir } => {
-            init_data_dir(&PathBuf::from(data_dir));
+        Command::Init { data_dir, service } => {
+            init_data_dir(&PathBuf::from(data_dir), service);
         }
         Command::Mcp { workspace } => {
             // MCP stdio：stdout 只承载协议消息，日志全部进 stderr
@@ -167,7 +220,7 @@ async fn main() {
     }
 }
 
-fn init_data_dir(data_dir: &PathBuf) {
+fn init_data_dir(data_dir: &PathBuf, service: bool) {
     if let Err(e) = std::fs::create_dir_all(data_dir) {
         eprintln!("创建数据目录失败: {e}");
         std::process::exit(1);
@@ -176,13 +229,24 @@ fn init_data_dir(data_dir: &PathBuf) {
     if env_path.exists() {
         println!("已存在 {}，跳过初始化", env_path.display());
     } else {
-        if std::fs::write(&env_path, PERSONAL_ENV_TEMPLATE).is_err() {
+        let template = if service {
+            SERVICE_ENV_TEMPLATE
+        } else {
+            PERSONAL_ENV_TEMPLATE
+        };
+        if std::fs::write(&env_path, template).is_err() {
             eprintln!("写入 .env 失败");
             std::process::exit(1);
         }
         println!("已生成 {}", env_path.display());
     }
-    println!("个人模式数据目录: {}", data_dir.display());
+    if service {
+        println!("服务模式数据目录: {}", data_dir.display());
+        println!("依赖: PostgreSQL（pgvector 可选）+ Redis");
+        println!("启动前: docker compose -f docker-compose.service.yml up -d");
+    } else {
+        println!("个人模式数据目录: {}", data_dir.display());
+    }
     println!("启动服务: oce serve --data-dir {}", data_dir.display());
 }
 
@@ -229,21 +293,8 @@ async fn serve(data_dir: PathBuf, env_file: Option<PathBuf>, host: String, port:
         }
     };
 
-    // worker（WORKER_ENABLED=true 时启动；个人模式默认同步索引）
-    if std::env::var("WORKER_ENABLED")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-    {
-        let queue = Arc::new(oce_app::worker::InProcessQueue::new());
-        let worker = oce_app::worker::EmbedWorker::new(
-            queue,
-            container.application.indexing.clone(),
-            container.application.blob_repo.clone(),
-            container.settings.worker.concurrency,
-            container.settings.worker.max_retries,
-        );
-        worker.start().await;
-        std::mem::forget(worker); // 常驻
+    // worker 已在容器装配时启动（WORKER_ENABLED=true；个人模式默认同步索引）
+    if container.application.queue.is_some() {
         tracing::info!("worker started");
     }
 

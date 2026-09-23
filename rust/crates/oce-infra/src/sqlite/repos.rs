@@ -168,25 +168,6 @@ fn extract_symbols_parallel(chunks: &[Chunk]) -> Vec<(String, String, String, i6
 }
 
 impl SqlBlobRepository {
-    /// 全部 blob 名（工作区嵌入式模式的删除/重建用）。
-    pub async fn find_all_blob_names(&self) -> OceResult<Vec<String>> {
-        let db = self.db.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let mut stmt = conn
-                    .prepare("SELECT blob_name FROM blobs ORDER BY blob_name")
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map([], |r| r.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?;
-                Ok(rows.filter_map(|r| r.ok()).collect())
-            })
-        })
-        .await
-        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
-        result.map_err(|m| OceError::new(m, "SqliteError"))
-    }
-
     /// bench 便捷入口：批量写 chunk 内容 + 符号 + 出现位置并标记已嵌入。
     pub async fn save_chunks_and_mark(
         &self,
@@ -221,6 +202,25 @@ impl SqlBlobRepository {
 
 #[async_trait]
 impl BlobRepository for SqlBlobRepository {
+    async fn find_all_blob_names(&self) -> OceResult<Vec<String>> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT blob_name FROM blobs ORDER BY blob_name")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
+
+
     async fn get(&self, blob_name: &str) -> OceResult<Option<Blob>> {
         let db = self.db.clone();
         let name = blob_name.to_string();
@@ -654,6 +654,50 @@ impl BlobRepository for SqlBlobRepository {
                     stmt.execute([hash]).map_err(|e| e.to_string())?;
                 }
                 Ok(())
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
+
+    async fn list_pending_names(&self) -> OceResult<Vec<String>> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT blob_name FROM blobs WHERE status = 'pending'")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
+
+    async fn find_stale_with_staging(&self, stale_hours: i64, limit: usize) -> OceResult<Vec<String>> {
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(stale_hours))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT b.blob_name FROM blobs b
+                         JOIN blob_staging s ON s.blob_name = b.blob_name
+                         WHERE b.status = 'pending' AND s.created_at < ?1 LIMIT ?2",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params![cutoff, limit as i64], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.filter_map(|r| r.ok()).collect::<Vec<String>>())
             })
         })
         .await

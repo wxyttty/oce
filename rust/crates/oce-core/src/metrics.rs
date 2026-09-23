@@ -3,6 +3,57 @@
 
 use crate::search::RetrievalAudit;
 
+/// /admin/stats 读模型（从 infra 迁入 core：PG 实现与 SQLite 实现共享）。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MonitoringStats {
+    pub api_calls: ApiCallStats,
+    pub tokens: Vec<TokenKindStats>,
+    pub retrieval: RetrievalStats,
+    #[serde(default)]
+    pub resource: Option<ResourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ApiCallStats {
+    pub calls: u64,
+    pub avg_latency_ms: f64,
+    pub error_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TokenKindStats {
+    pub kind: String,
+    pub model: String,
+    pub calls: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RetrievalStats {
+    pub count: u64,
+    pub empty_count: u64,
+}
+
+/// 最新资源快照（/admin/stats 的 resource 字段）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResourceSnapshot {
+    pub ts: String,
+    pub mem_rss_bytes: u64,
+    pub mem_percent: f64,
+    pub cpu_percent: f64,
+    pub disk_free_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_data_bytes: u64,
+}
+
+/// 监控窗口统计读端口（infra 提供 SQLite/PG 实现）。
+#[async_trait::async_trait]
+pub trait MonitoringStatsReader: Send + Sync {
+    async fn stats(&self, window_hours: u32) -> MonitoringStats;
+}
+
 /// 每次外部模型调用一行的 token 消耗记录。
 #[derive(Debug, Clone)]
 pub struct TokenUsageRecord {

@@ -8,8 +8,8 @@
 use crate::openai::embedder::{OpenAIEmbedder, UsageCallback};
 use crate::openai::llm::OpenAILlmClient;
 use crate::settings::{EmbeddingSettings, LlmSettings, RerankSettings};
-use crate::sqlite::credentials::{RuntimeCredential, SqlCredentialAdminStore};
 use async_trait::async_trait;
+use oce_core::credentials::RuntimeCredential;
 use oce_core::error::{OceError, OceResult};
 use oce_core::search::Embedder;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 /// embedding 运行时：延迟解析 + 热重载。
 pub struct CredentialConfiguredEmbedder {
-    store: SqlCredentialAdminStore,
+    store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
     fallback: EmbeddingSettings,
     expected_dimensions: usize,
     on_usage: Option<UsageCallback>,
@@ -26,7 +26,7 @@ pub struct CredentialConfiguredEmbedder {
 
 impl CredentialConfiguredEmbedder {
     pub fn new(
-        store: SqlCredentialAdminStore,
+        store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
         fallback: EmbeddingSettings,
         expected_dimensions: usize,
         on_usage: Option<UsageCallback>,
@@ -191,7 +191,7 @@ impl Embedder for CredentialConfiguredEmbedder {
 
 /// LLM 客户端运行时（llm_rerank / query_rewrite / intent 各一份，kind 区分）。
 pub struct CredentialConfiguredLlmClient {
-    store: SqlCredentialAdminStore,
+    store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
     kind: String,
     fallback: LlmSettings,
     fallback_model: String,
@@ -201,7 +201,7 @@ pub struct CredentialConfiguredLlmClient {
 
 impl CredentialConfiguredLlmClient {
     pub fn new(
-        store: SqlCredentialAdminStore,
+        store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
         kind: &str,
         fallback: LlmSettings,
         fallback_model: String,
@@ -295,7 +295,7 @@ impl CredentialConfiguredLlmClient {
 
 /// API rerank 凭据运行时。
 pub struct CredentialConfiguredReranker {
-    store: SqlCredentialAdminStore,
+    store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
     fallback: RerankSettings,
     fallback_api_key: Option<String>,
     on_usage: Option<crate::openai::llm::UsageCallback>,
@@ -304,7 +304,7 @@ pub struct CredentialConfiguredReranker {
 
 impl CredentialConfiguredReranker {
     pub fn new(
-        store: SqlCredentialAdminStore,
+        store: Arc<dyn oce_core::credentials::CredentialAdminStore>,
         fallback: RerankSettings,
         fallback_api_key: Option<String>,
         on_usage: Option<crate::openai::llm::UsageCallback>,
@@ -370,6 +370,7 @@ impl CredentialConfiguredReranker {
                 &model,
                 top_n,
                 min_score,
+                self.fallback.max_docs,
                 self.fallback.timeout_seconds,
                 self.on_usage.clone(),
                 credential_id,

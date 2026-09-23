@@ -199,8 +199,8 @@ pub async fn run_stdio(workspace: PathBuf) -> Result<(), String> {
         container.application.indexing.clone(),
         container.application.retrieval.clone(),
         container.application.blob_repo.clone(),
-        container.db.clone(),
-        container.application.trivium.clone(),
+        container.db.clone().expect("MCP 嵌入模式需要 SQLite（workspace_files 登记表）"),
+        container.application.vector.clone(),
     ));
     let state: Option<Arc<WorkspaceIndexer>> = Some(indexer);
 

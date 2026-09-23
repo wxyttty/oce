@@ -1,62 +1,15 @@
-//! 后台嵌入 worker（进程内队列）。与 Python `application/worker.py` 语义对齐：
+//! 后台嵌入 worker。与 Python `application/worker.py` 语义对齐：
 //! 消费 blob 名 → embed_pending → ack；失败 retry_count++，超限 mark_error + 清 staging。
 //!
-//! 个人模式默认关闭（同步索引）；WORKER_ENABLED=true 时启动 N 个并发消费协程。
+//! 队列走 `oce_core::queue::Queue` 端口（进程内 / Redis 同一消费循环）。
 
 use oce_core::indexing::{BlobRepository, IndexingPipeline};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-
-/// 进程内队列（替代 Redis；服务模式的 Redis 队列留待后续阶段）。
-#[derive(Clone)]
-pub struct InProcessQueue {
-    tx: mpsc::UnboundedSender<String>,
-    rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>>,
-    inflight: Arc<std::sync::atomic::AtomicUsize>,
-    queued: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl InProcessQueue {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Self {
-            tx,
-            rx: Arc::new(tokio::sync::Mutex::new(rx)),
-            inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn enqueue(&self, blob_name: &str) {
-        if self.tx.send(blob_name.to_string()).is_ok() {
-            self.queued
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    async fn dequeue(&self) -> Option<String> {
-        let name = self.rx.lock().await.recv().await;
-        if name.is_some() {
-            self.queued
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        name
-    }
-
-    pub fn size(&self) -> usize {
-        // tokio UnboundedSender 无长度查询；用 queued 计数器近似
-        self.queued.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn inflight(&self) -> usize {
-        self.inflight.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
 
 pub struct EmbedWorker {
-    queue: Arc<InProcessQueue>,
+    queue: Arc<dyn oce_core::queue::Queue>,
     indexing: Arc<IndexingPipeline>,
-    blob_repo: Arc<oce_infra::sqlite::repos::SqlBlobRepository>,
+    blob_repo: Arc<dyn BlobRepository>,
     concurrency: usize,
     max_retries: u32,
     running: Arc<std::sync::atomic::AtomicBool>,
@@ -65,9 +18,9 @@ pub struct EmbedWorker {
 
 impl EmbedWorker {
     pub fn new(
-        queue: Arc<InProcessQueue>,
+        queue: Arc<dyn oce_core::queue::Queue>,
         indexing: Arc<IndexingPipeline>,
-        blob_repo: Arc<oce_infra::sqlite::repos::SqlBlobRepository>,
+        blob_repo: Arc<dyn BlobRepository>,
         concurrency: usize,
         max_retries: u32,
     ) -> Self {
@@ -86,10 +39,15 @@ impl EmbedWorker {
         self.running.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 启动 N 个消费协程。
+    /// 启动前恢复上次崩溃残留（Redis 语义；进程内恒 0），再拉起 N 个消费协程。
     pub async fn start(&self) {
         if self.is_running() {
             return;
+        }
+        match self.queue.recover_processing().await {
+            Ok(n) if n > 0 => tracing::info!("EmbedWorker: 恢复 {n} 条处理中残留任务"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("EmbedWorker: recover_processing 失败: {e}"),
         }
         self.running
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -119,25 +77,32 @@ impl EmbedWorker {
 
 async fn worker_loop(
     worker_id: usize,
-    queue: Arc<InProcessQueue>,
+    queue: Arc<dyn oce_core::queue::Queue>,
     indexing: Arc<IndexingPipeline>,
-    repo: Arc<oce_infra::sqlite::repos::SqlBlobRepository>,
+    repo: Arc<dyn BlobRepository>,
     running: Arc<std::sync::atomic::AtomicBool>,
     max_retries: u32,
 ) {
     while running.load(std::sync::atomic::Ordering::Relaxed) {
-        let Some(blob_name) = queue.dequeue().await else {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            continue;
+        // 与 Python dequeue(timeout=5) 一致：超时返回 None 后轻睡重试
+        let blob_name = match queue.dequeue(5).await {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("worker#{worker_id} dequeue 异常: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
         };
-        queue
-            .inflight
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = indexing
             .embed_pending(Some(&[blob_name.clone()]), false)
             .await;
         match result {
             Ok(_) => {
+                let _ = queue.ack(&blob_name).await;
                 tracing::debug!(
                     "worker#{worker_id} processed blob {}",
                     &blob_name[..12.min(blob_name.len())]
@@ -145,6 +110,7 @@ async fn worker_loop(
             }
             Err(exc) => {
                 tracing::warn!("worker#{worker_id} process 失败 blob {blob_name}: {exc}");
+                let _ = queue.fail(&blob_name).await;
                 // DB 层重试：超限 mark_error + 删 staging；未超限保留 staging 供重试
                 let mut exceeded = false;
                 if let Ok(Some(mut blob)) = repo.get(&blob_name).await {
@@ -162,12 +128,9 @@ async fn worker_loop(
                     }
                 }
                 if !exceeded {
-                    queue.enqueue(&blob_name); // 重新入队
+                    let _ = queue.enqueue(&blob_name).await; // 重新入队
                 }
             }
         }
-        queue
-            .inflight
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

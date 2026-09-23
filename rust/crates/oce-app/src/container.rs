@@ -12,7 +12,7 @@ use oce_core::search::{
 use oce_infra::credentials::CredentialConfiguredReranker;
 use oce_infra::settings::Settings;
 use oce_infra::sqlite::chains::SqlChainRepository;
-use oce_infra::sqlite::credentials::{RuntimeCredential, SqlCredentialAdminStore};
+use oce_infra::sqlite::credentials::SqlCredentialAdminStore;
 use oce_infra::sqlite::metrics::SqlMetricsSink;
 use oce_infra::sqlite::repos::SqlBlobRepository;
 use oce_infra::static_embed::StaticEmbedder;
@@ -456,11 +456,12 @@ impl IntentClassifier for IntentClassifierImpl {
 /// 容器：进程内单例装配。
 pub struct Container {
     pub settings: Settings,
-    /// 共享 SQLite 句柄（MCP 嵌入模式的工作区登记表复用同一连接池）
-    pub db: oce_infra::sqlite::SqlDb,
+    /// 共享 SQLite 句柄（MCP 嵌入模式的工作区登记表复用同一连接池；PG 模式为 None）
+    pub db: Option<oce_infra::sqlite::SqlDb>,
     pub application: Arc<crate::service::RetrievalApplication>,
-    pub metrics: Option<Arc<SqlMetricsSink>>,
-    pub credential_admin: Arc<SqlCredentialAdminStore>,
+    /// admin 读视角（/admin/stats）；monitoring 关闭时 None
+    pub stats_reader: Option<Arc<dyn oce_core::metrics::MonitoringStatsReader>>,
+    pub credential_admin: Arc<dyn oce_core::credentials::CredentialAdminStore>,
     pub embedder: Arc<oce_infra::credentials::CredentialConfiguredEmbedder>,
     /// 实际生效的向量化提供方（static | openai）
     pub embed_provider: &'static str,
@@ -468,6 +469,8 @@ pub struct Container {
     pub vector_dim: usize,
     pub llm_reranker: Option<Arc<LlmRerankerImpl>>,
     pub rerank_api: Option<Arc<CredentialConfiguredReranker>>,
+    /// 报表读端口（/admin/reports/*）
+    pub reports: Arc<dyn oce_core::reports::ReportsStore>,
     /// 数据目录（SQLite/TriviumDB 所在目录；storage 报表用）。SQLite 相对路径时为 None。
     pub data_dir: Option<String>,
     /// 资源采样器（monitoring 关闭时 None；drop 时停止）
@@ -488,114 +491,224 @@ impl Container {
         // 内存硬限制初始化（OCE_MEMORY_LIMIT_MB）
         oce_infra::memory_guard::init(settings.memory_limit_mb);
 
-        if settings.database.sqlite_path().is_none() {
-            return Err("Rust 版第一阶段仅支持 SQLite 个人模式（DB_URL 需以 sqlite 开头）".into());
-        }
-        let sqlite_path = settings.database.sqlite_path().unwrap();
+        // ── 元数据后端分流：sqlite（个人模式）| postgres（服务模式）──
+        // 产出全部 trait 对象 + 数据目录 + MCP 用的 SQLite 句柄；reports 延后装配
+        // （SQLite 版需要 TriviumHandle 的 kind_stats 闭包，PG 版直接可用）。
+        let is_sqlite = settings.database.is_sqlite();
+        let blob_repo: Arc<dyn oce_core::indexing::BlobRepository>;
+        let chain_repo: Arc<dyn oce_core::chain::ChainRepository>;
+        let credential_store: Arc<dyn oce_core::credentials::CredentialAdminStore>;
+        let first_chunk_lookup: Arc<dyn oce_core::retrieval::FirstChunkLookup>;
+        let exact_store: Arc<dyn oce_core::search::ExactSearchStore>;
+        let file_content_lookup: Option<Arc<dyn oce_core::retrieval::FileContentLookup>>;
+        let metrics_sink: Option<Arc<dyn oce_core::metrics::MetricsSink>>;
+        let stats_reader: Option<Arc<dyn oce_core::metrics::MonitoringStatsReader>>;
+        let pg_pool: Option<sqlx::PgPool>;
+        let db: Option<oce_infra::sqlite::SqlDb>;
+        let data_dir: Option<String>;
+        // SQLite 模式的 .tdb 推导基准路径（PG 模式 TriviumDB 路径必须显式配置）
+        let sqlite_path: String;
 
-        // ── SQLite 元数据 ──
-        let db = oce_infra::sqlite::SqlDb::open(&sqlite_path)?;
-        let blob_repo = Arc::new(SqlBlobRepository { db: db.clone() });
-        let chain_repo = Arc::new(SqlChainRepository { db: db.clone() });
-        let credential_store = SqlCredentialAdminStore { db: db.clone() };
-        let credential_admin = Arc::new(credential_store.clone());
-        let credential_store = Arc::new(credential_store);
+        if is_sqlite {
+            sqlite_path = settings.database.sqlite_path().unwrap();
+            let sqlite = oce_infra::sqlite::SqlDb::open(&sqlite_path)?;
+            let sink = if settings.monitoring.enabled {
+                let s = Arc::new(SqlMetricsSink::new(sqlite.clone()));
+                s.clone().spawn_flush_task(settings.monitoring.flush_interval_seconds);
+                s.clone().spawn_cleanup_task(
+                    settings.monitoring.retention_days,
+                    settings.monitoring.cleanup_interval_seconds,
+                );
+                Some(s)
+            } else {
+                None
+            };
+            metrics_sink = sink
+                .as_ref()
+                .map(|m| Arc::clone(m) as Arc<dyn oce_core::metrics::MetricsSink>);
+            stats_reader = sink
+                .as_ref()
+                .map(|m| Arc::clone(m) as Arc<dyn oce_core::metrics::MonitoringStatsReader>);
+            blob_repo = Arc::new(SqlBlobRepository { db: sqlite.clone() });
+            chain_repo = Arc::new(SqlChainRepository { db: sqlite.clone() });
+            credential_store = Arc::new(SqlCredentialAdminStore { db: sqlite.clone() });
+            first_chunk_lookup = Arc::new(oce_infra::sqlite::chains::SqlFirstChunkLookup {
+                db: sqlite.clone(),
+            });
+            exact_store = Arc::new(oce_infra::sqlite::chains::SqlExactStore {
+                db: sqlite.clone(),
+                max_scope_blobs: settings.retrieval.inner.exact_max_scope_blobs,
+            });
+            file_content_lookup = if settings.retrieval.inner.span_merge_enabled {
+                Some(Arc::new(
+                    oce_infra::sqlite::chains::SqlFileContentLookup { db: sqlite.clone() },
+                ))
+            } else {
+                None
+            };
+            db = Some(sqlite);
+            pg_pool = None;
+            data_dir = std::path::Path::new(&sqlite_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_string())
+                .filter(|_| std::path::Path::new(&sqlite_path).is_absolute());
+        } else {
+            // PostgreSQL 服务模式：URL 归一化（sqlx 不认 sqlalchemy 的 +asyncpg 方言标记）
+            let raw_url = settings.database.url.clone();
+            let url = raw_url
+                .replace("postgresql+asyncpg://", "postgres://")
+                .replace("postgresql://", "postgres://");
+            let pool = oce_infra::pg::open_pool(&url, settings.database.pool_size as u32)
+                .await
+                .map_err(|e| format!("PostgreSQL 元数据后端初始化失败: {e}"))?;
+            let sink = if settings.monitoring.enabled {
+                let s = Arc::new(oce_infra::pg::metrics::PgMetricsSink::new(pool.clone()));
+                s.clone().spawn_flush_task(settings.monitoring.flush_interval_seconds);
+                s.clone().spawn_cleanup_task(
+                    settings.monitoring.retention_days,
+                    settings.monitoring.cleanup_interval_seconds,
+                );
+                Some(s)
+            } else {
+                None
+            };
+            metrics_sink = sink
+                .as_ref()
+                .map(|m| Arc::clone(m) as Arc<dyn oce_core::metrics::MetricsSink>);
+            stats_reader = sink
+                .as_ref()
+                .map(|m| Arc::clone(m) as Arc<dyn oce_core::metrics::MonitoringStatsReader>);
+            blob_repo = Arc::new(oce_infra::pg::repos::PgBlobRepository { pool: pool.clone() });
+            chain_repo = Arc::new(oce_infra::pg::chains::PgChainRepository { pool: pool.clone() });
+            credential_store = Arc::new(oce_infra::pg::credentials::PgCredentialAdminStore {
+                pool: pool.clone(),
+            });
+            first_chunk_lookup = Arc::new(oce_infra::pg::chains::PgFirstChunkLookup {
+                pool: pool.clone(),
+            });
+            exact_store = Arc::new(oce_infra::pg::chains::PgExactStore {
+                pool: pool.clone(),
+                max_scope_blobs: settings.retrieval.inner.exact_max_scope_blobs,
+            });
+            file_content_lookup = if settings.retrieval.inner.span_merge_enabled {
+                Some(Arc::new(oce_infra::pg::chains::PgFileContentLookup {
+                    pool: pool.clone(),
+                }))
+            } else {
+                None
+            };
+            db = None; // MCP 嵌入模式需要 SQLite（workspace_files 登记表）
+            pg_pool = Some(pool);
+            data_dir = None; // PG 模式数据目录语义不同（库在服务端），报表降级
+            sqlite_path = String::new(); // 未用
+        }
+        let credential_admin = credential_store.clone();
 
         // ── 向量化提供方解析（维度在打开 TriviumDB 前确定） ──
         let (embedder, vector_dim, embed_runtime, provider_name, model_tag) =
             resolve_embed_provider(&settings, &credential_store, embedder_override).await?;
-        let mut tdb_settings = settings.trivium.clone();
-        tdb_settings.dense_dim = vector_dim;
-        if tdb_settings.path.is_empty() {
-            // 未显式配置时与 SQLite 同目录
-            tdb_settings.path = sqlite_path
-                .rsplit_once('/')
-                .map(|(dir, _)| format!("{dir}/oce.tdb"))
-                .unwrap_or_else(|| "oce.tdb".into());
-        }
-        if let Some(parent) = std::path::Path::new(&tdb_settings.path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // 嵌入模型指纹 sidecar：同维度不同模型的向量混入同一索引会静默污染检索，
-        // 换模型必须重建索引（fail-closed 提示，不做静默兼容）。etext=v2 标记
-        // embedding_text 格式（含规则层文件描述注入）——开启 file_desc 后旧向量
-        // 与新文本语义不同，与换模型同语义：强制重建。
-        let sidecar_path = format!("{}.model", tdb_settings.path);
-        let tdb_path_display = tdb_settings.path.clone();
         // etext 版本化 embedding_text 格式（v2 = 含规则层文件描述注入）。
-        // 条件式迁移：关闭态写 v1 且兼容旧格式 sidecar（无 etext 后缀，语义同为
-        // 无描述注入）——否则默认关闭的实验开关会强迫全部用户零语义变化重嵌；
-        // 开启态写 v2，旧格式/v1 一律 fail-closed（与换模型同语义）。
         let etext_version: &str = if settings.retrieval.file_desc_enabled {
             "etext=v2"
         } else {
             "etext=v1"
         };
         let model_fingerprint = format!("{model_tag} dim={vector_dim} {etext_version}");
-        let legacy_no_etext = format!("{model_tag} dim={vector_dim}");
-        let tdb_exists = std::path::Path::new(&tdb_settings.path).exists();
-        if tdb_exists {
-            match std::fs::read_to_string(&sidecar_path) {
-                Ok(recorded) => {
-                    let recorded = recorded.trim();
-                    let compatible = recorded == model_fingerprint
-                        || (etext_version == "etext=v1" && recorded == legacy_no_etext);
-                    if !recorded.is_empty() && !compatible {
+
+        // ── 向量引擎分流：trivium（默认）| pgvector（PG 一体化）──
+        // 两者实现同一组端口（SearchStore/VectorIndex/PathSearchStore/VectorEngine），
+        // 下游装配无感知。模型指纹 fail-closed 语义一致。
+        let vector_engine: Arc<dyn oce_core::search::VectorEngine>;
+        let trivium: Option<oce_infra::trivium::TriviumHandle>;
+        if settings.vector_backend.backend == "pgvector" {
+            if is_sqlite {
+                return Err(
+                    "VECTOR_BACKEND=pgvector 需要服务模式（DB_URL 指向 PostgreSQL）".into(),
+                );
+            }
+            let pool = pg_pool
+                .clone()
+                .expect("pg mode"); // is_sqlite=false 时必然存在
+            let store = oce_infra::pgvector::PgVectorStore::open(pool, model_fingerprint)
+                .await
+                .map_err(|e| format!("pgvector 引擎初始化失败: {e}"))?;
+            vector_engine = Arc::new(store);
+            trivium = None;
+        } else {
+            let mut tdb_settings = settings.trivium.clone();
+            tdb_settings.dense_dim = vector_dim;
+            if tdb_settings.path.is_empty() {
+                if is_sqlite {
+                    // 未显式配置时与 SQLite 同目录
+                    tdb_settings.path = sqlite_path
+                        .rsplit_once('/')
+                        .map(|(dir, _)| format!("{dir}/oce.tdb"))
+                        .unwrap_or_else(|| "oce.tdb".into());
+                } else {
+                    return Err(
+                        "PG 服务模式必须显式配置 TRIVIUM_PATH（向量库文件路径）".into(),
+                    );
+                }
+            }
+            if let Some(parent) = std::path::Path::new(&tdb_settings.path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // 嵌入模型指纹 sidecar：同维度不同模型的向量混入同一索引会静默污染检索，
+            // 换模型必须重建索引（fail-closed 提示，不做静默兼容）。etext=v2 标记
+            // embedding_text 格式（含规则层文件描述注入）——开启 file_desc 后旧向量
+            // 与新文本语义不同，与换模型同语义：强制重建。
+            // 条件式迁移：关闭态写 v1 且兼容旧格式 sidecar（无 etext 后缀，语义同为
+            // 无描述注入）——否则默认关闭的实验开关会强迫全部用户零语义变化重嵌；
+            // 开启态写 v2，旧格式/v1 一律 fail-closed（与换模型同语义）。
+            let sidecar_path = format!("{}.model", tdb_settings.path);
+            let tdb_path_display = tdb_settings.path.clone();
+            let legacy_no_etext = format!("{model_tag} dim={vector_dim}");
+            let tdb_exists = std::path::Path::new(&tdb_settings.path).exists();
+            if tdb_exists {
+                match std::fs::read_to_string(&sidecar_path) {
+                    Ok(recorded) => {
+                        let recorded = recorded.trim();
+                        let compatible = recorded == model_fingerprint
+                            || (etext_version == "etext=v1" && recorded == legacy_no_etext);
+                        if !recorded.is_empty() && !compatible {
+                            return Err(format!(
+                                "既有索引的嵌入配置与当前配置不符：\n  索引由 [{recorded}] 构建\n  当前配置 [{model_fingerprint}]\n                             请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传，以重建索引。"
+                            ));
+                        }
+                    }
+                    Err(_) if !std::path::Path::new(&sidecar_path).exists() => {
                         return Err(format!(
-                            "既有索引的嵌入配置与当前配置不符：\n  索引由 [{recorded}] 构建\n  当前配置 [{model_fingerprint}]\n                             请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传，以重建索引。"
+                            "既有索引缺少模型指纹（{sidecar_path} 不存在，由旧版本创建）。\n                         请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传。"
                         ));
                     }
+                    _ => {}
                 }
-                Err(_) if !std::path::Path::new(&sidecar_path).exists() => {
-                    return Err(format!(
-                        "既有索引缺少模型指纹（{sidecar_path} 不存在，由旧版本创建）。\n                         请删除 {tdb_path_display}（或改用新数据目录）并清空客户端 .oce-client/state.sqlite3 后重新上传。"
-                    ));
-                }
-                _ => {}
             }
+            std::fs::write(&sidecar_path, &model_fingerprint)
+                .map_err(|e| format!("write model sidecar: {e}"))?;
+            let trivium_store = oce_infra::trivium::TriviumStore::open(tdb_settings.clone())
+                .map_err(|e| {
+                    format!(
+                        "open triviumdb `{}`: {e}\n提示：TriviumDB 维度创建后不可变。若更换了 embedding \
+                         模型，请设置 MILVUS_DENSE_DIM/EMBED_DIMENSIONS 与既有 .tdb 一致，或改用新数据目录。",
+                        tdb_settings.path
+                    )
+                })?;
+            let handle: oce_infra::trivium::TriviumHandle = Arc::new(trivium_store);
+            vector_engine = handle.clone();
+            trivium = Some(handle);
         }
-        std::fs::write(&sidecar_path, &model_fingerprint)
-            .map_err(|e| format!("write model sidecar: {e}"))?;
-        let trivium_store = oce_infra::trivium::TriviumStore::open(tdb_settings.clone())
-            .map_err(|e| {
-                format!(
-                    "open triviumdb `{}`: {e}\n提示：TriviumDB 维度创建后不可变。若更换了 embedding \
-                     模型，请设置 MILVUS_DENSE_DIM/EMBED_DIMENSIONS 与既有 .tdb 一致，或改用新数据目录。",
-                    tdb_settings.path
-                )
-            })?;
-        let trivium: oce_infra::trivium::TriviumHandle = Arc::new(trivium_store);
 
-        // ── 监控（旁路，非阻塞） ──
-        let metrics = if settings.monitoring.enabled {
-            let sink = Arc::new(SqlMetricsSink::new(db.clone()));
-            sink.clone()
-                .spawn_flush_task(settings.monitoring.flush_interval_seconds);
-            sink.clone().spawn_cleanup_task(
-                settings.monitoring.retention_days,
-                settings.monitoring.cleanup_interval_seconds,
-            );
-            Some(sink)
-        } else {
-            None
-        };
-        // 数据目录：SQLite 绝对路径时取其父目录（storage/resources 报表用）
-        let data_dir = std::path::Path::new(&sqlite_path)
-            .parent()
-            .and_then(|p| p.to_str())
-            .map(|s| s.to_string())
-            .filter(|_| std::path::Path::new(&sqlite_path).is_absolute());
         // 资源采样：monitoring 开启时后台周期采集（旁路，drop 时停止）
         let resource_sampler = oce_infra::resource_sampler::ResourceSampler::start(
-            metrics
-                .clone()
-                .map(|m| m as Arc<dyn oce_core::metrics::MetricsSink>),
+            metrics_sink.clone(),
             settings.monitoring.resource_sample_interval_seconds,
             data_dir.clone(),
         );
         let on_usage: Option<oce_infra::openai::embedder::UsageCallback> =
-            metrics.as_ref().map(|m| {
-                let m = m.clone() as Arc<dyn oce_core::metrics::MetricsSink>;
+            metrics_sink.as_ref().map(|m| {
+                let m = m.clone();
                 Arc::new(
                     move |credential_id: i64,
                           kind: &str,
@@ -624,10 +737,13 @@ impl Container {
         let gate = Arc::new(EmbeddingGateImpl {
             enabled: std::sync::atomic::AtomicBool::new(settings.embedding.enabled),
         });
-        let vector_index: Arc<dyn oce_core::search::VectorIndex> = trivium.clone();
+        let vector_index: Arc<dyn oce_core::search::VectorIndex> = vector_engine.clone();
+        let engine_as_path_store: Arc<dyn oce_core::search::PathSearchStore> =
+            vector_engine.clone();
+        let engine_as_search_store: Arc<dyn SearchStore> = vector_engine.clone();
         let path_store_for_index: Option<Arc<dyn oce_core::search::PathSearchStore>> =
             if settings.retrieval.path_index_enabled {
-                Some(trivium.clone())
+                Some(engine_as_path_store.clone())
             } else {
                 None
             };
@@ -645,26 +761,21 @@ impl Container {
 
         // ── 检索管线 ──
         let retrieval_settings: RetrievalSettings = settings.retrieval.inner.clone();
-        let search_store: Arc<dyn SearchStore> = trivium.clone();
-        let mut pipeline =
-            RetrievalPipeline::new(embedder.clone(), search_store, retrieval_settings.clone())
-                .with_first_chunk_lookup(Arc::new(
-                    oce_infra::sqlite::chains::SqlFirstChunkLookup { db: db.clone() },
-                ));
-        pipeline.exact_store = Some(Arc::new(oce_infra::sqlite::chains::SqlExactStore {
-            db: db.clone(),
-            max_scope_blobs: retrieval_settings.exact_max_scope_blobs,
-        }));
+        let search_store: Arc<dyn SearchStore> = engine_as_search_store.clone();
+        let mut pipeline = RetrievalPipeline::new(
+            embedder.clone(),
+            search_store,
+            retrieval_settings.clone(),
+        )
+        .with_first_chunk_lookup(first_chunk_lookup);
+        pipeline.exact_store = Some(exact_store);
         if retrieval_settings.span_merge_enabled {
-            pipeline.file_content_lookup =
-                Some(Arc::new(oce_infra::sqlite::chains::SqlFileContentLookup {
-                    db: db.clone(),
-                }));
+            pipeline.file_content_lookup = file_content_lookup;
         }
         pipeline.related_symbols_enabled = retrieval_settings.related_symbols_enabled;
         pipeline.broad_mode_enabled = retrieval_settings.broad_mode_enabled;
         if settings.retrieval.path_index_enabled {
-            let ps: Arc<dyn PathSearchStore> = trivium.clone();
+            let ps: Arc<dyn PathSearchStore> = engine_as_path_store.clone();
             pipeline.path_store = Some(ps);
         }
         // API rerank（RERANK_ENABLED）：本地 llama-server /v1/rerank 等端点接入主重排层。
@@ -682,7 +793,7 @@ impl Container {
                     .is_some();
             if has_channel {
                 let runtime = Arc::new(CredentialConfiguredReranker::new(
-                    credential_store.as_ref().clone(),
+                    credential_store.clone(),
                     settings.rerank.clone(),
                     settings.embedding.api_key.clone(),
                     on_usage.clone(),
@@ -735,7 +846,7 @@ impl Container {
         if any_llm {
             let make_client = |kind: &str, fallback_model: String| {
                 Arc::new(oce_infra::credentials::CredentialConfiguredLlmClient::new(
-                    credential_store.as_ref().clone(),
+                    credential_store.clone(),
                     kind,
                     settings.llm.clone(),
                     fallback_model,
@@ -776,28 +887,127 @@ impl Container {
             }
         }
 
+        // ── 任务队列（REDIS_URL 配置时走 Redis，否则进程内）──
+        // worker 消费协程在容器装配时启动（与 Python EmbedWorker.start 一致）。
+        // Redis 模式：dequeue 是秒级阻塞，worker 各持一条专用连接（见 RedisQueue 注释）。
+        let queue: Option<Arc<dyn oce_core::queue::Queue>> = if settings.worker.enabled {
+            let redis_configured = std::env::var("REDIS_URL")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let q: Arc<dyn oce_core::queue::Queue> = if redis_configured {
+                match oce_infra::redis_queue::RedisQueue::connect(
+                    &settings.redis.url,
+                    &settings.redis.queue_name,
+                )
+                .await
+                {
+                    Ok(q) => Arc::new(q),
+                    Err(e) => {
+                        return Err(format!("Redis 队列连接失败（REDIS_URL 已配置）: {e}"));
+                    }
+                }
+            } else {
+                Arc::new(crate::queue::InProcessQueue::new())
+            };
+            let worker = crate::worker::EmbedWorker::new(
+                q.clone(),
+                indexing.clone(),
+                blob_repo.clone(),
+                settings.worker.concurrency,
+                settings.worker.max_retries,
+            );
+            worker.start().await;
+            std::mem::forget(worker); // 常驻（容器生命周期即进程生命周期）
+            Some(q)
+        } else {
+            None
+        };
+
+        // ── 报表读端口（/admin/reports/*；vector_stats 闭包注入保持 reader 纯 SQL） ──
+        let reports: Arc<dyn oce_core::reports::ReportsStore> = if is_sqlite {
+            let trivium_for_stats = vector_engine.clone();
+            let tdb_path = settings.trivium.path.clone();
+            let vector_stats = std::sync::Arc::new(move || {
+                let collections = trivium_for_stats
+                    .kind_stats()
+                    .into_iter()
+                    .map(|(name, rows)| oce_core::reports::VectorCollectionStat {
+                        name,
+                        rows: rows as u64,
+                        est_bytes: 0,
+                    })
+                    .collect();
+                let file_bytes = std::fs::metadata(&tdb_path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                oce_core::reports::VectorStoreStat {
+                    mode: "lite".into(),
+                    collections,
+                    file_bytes,
+                    error: None,
+                }
+            });
+            Arc::new(oce_infra::sqlite::reports::ReportsReader::new(
+                db.clone().expect("sqlite mode"),
+                data_dir.clone(),
+                Some(vector_stats),
+                vector_dim,
+            ))
+        } else {
+            let trivium_for_stats = vector_engine.clone();
+            let tdb_path = settings.trivium.path.clone();
+            let vector_stats = std::sync::Arc::new(move || {
+                let collections = trivium_for_stats
+                    .kind_stats()
+                    .into_iter()
+                    .map(|(name, rows)| oce_core::reports::VectorCollectionStat {
+                        name,
+                        rows: rows as u64,
+                        est_bytes: 0,
+                    })
+                    .collect();
+                let file_bytes = std::fs::metadata(&tdb_path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(0);
+                oce_core::reports::VectorStoreStat {
+                    mode: "server".into(),
+                    collections,
+                    file_bytes,
+                    error: None,
+                }
+            });
+            Arc::new(oce_infra::pg::reports::PgReportsReader::new(
+                pg_pool.clone().expect("pg mode"),
+                data_dir.clone(),
+                Some(vector_stats),
+                vector_dim,
+            ))
+        };
+
         let application = Arc::new(crate::service::RetrievalApplication::new(
             indexing,
             Arc::new(pipeline),
             blob_repo,
             chain_repo,
-            trivium,
-            metrics.clone(),
+            vector_engine.clone(),
+            metrics_sink.clone(),
             settings.monitoring.enabled && settings.monitoring.retrieval_audit_enabled,
             settings.monitoring.store_query_text,
+            queue,
         ));
 
         Ok(Arc::new(Self {
             settings,
-            db: db.clone(),
+            db,
             application,
-            metrics,
+            stats_reader,
             credential_admin,
             embedder: embedder_runtime,
             embed_provider: provider_name,
             vector_dim,
             llm_reranker,
             rerank_api,
+            reports,
             data_dir,
             resource_sampler,
         }))
@@ -813,13 +1023,13 @@ impl Container {
 }
 
 /// resolve_active 返回类型的便捷 re-export（server 层使用）。
-pub type ResolvedCredential = RuntimeCredential;
+pub type ResolvedCredential = oce_core::credentials::RuntimeCredential;
 
 /// 向量化提供方解析：auto（有 key/凭据→openai，否则 static）| static | openai。
 /// 返回 (嵌入器, 向量维度, reload 运行时, 提供方名)。
 async fn resolve_embed_provider(
     settings: &Settings,
-    credential_store: &SqlCredentialAdminStore,
+    credential_store: &Arc<dyn oce_core::credentials::CredentialAdminStore>,
     embedder_override: Option<Arc<dyn oce_core::search::Embedder>>,
 ) -> Result<
     (

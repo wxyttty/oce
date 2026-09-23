@@ -71,8 +71,8 @@ async fn indexer_for(tag: &str) -> Arc<WorkspaceIndexer> {
         container.application.indexing.clone(),
         container.application.retrieval.clone(),
         container.application.blob_repo.clone(),
-        container.db.clone(),
-        container.application.trivium.clone(),
+        container.db.clone().unwrap(),
+        container.application.vector.clone(),
     ))
 }
 

@@ -19,3 +19,4 @@ async-trait = { workspace = true }
 ignore = "0.4"
 rayon = { workspace = true }
 rusqlite = { workspace = true }
+sqlx = { workspace = true }

@@ -147,9 +147,9 @@ pub struct CredentialListResponse {
     pub credentials: Vec<CredentialResponse>,
 }
 
-pub type CredentialCreateRequest = oce_infra::sqlite::credentials::CredentialUpsert;
-pub type CredentialUpdateRequest = oce_infra::sqlite::credentials::CredentialUpsert;
-pub type CredentialDuplicateRequest = oce_infra::sqlite::credentials::CredentialUpsert;
+pub type CredentialCreateRequest = oce_core::credentials::CredentialUpsert;
+pub type CredentialUpdateRequest = oce_core::credentials::CredentialUpsert;
+pub type CredentialDuplicateRequest = oce_core::credentials::CredentialUpsert;
 
 #[derive(Debug, Serialize)]
 pub struct QueueStatusResponse {

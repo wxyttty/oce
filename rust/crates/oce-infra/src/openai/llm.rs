@@ -413,6 +413,8 @@ pub struct OpenAIReranker {
     model: String,
     top_n: usize,
     min_score: f32,
+    /// 单次请求文档数上限：超过则分批串行，全局重排后截断
+    max_docs: usize,
     on_usage: Option<UsageCallback>,
     credential_id: i64,
 }
@@ -425,6 +427,7 @@ impl OpenAIReranker {
         model: &str,
         top_n: usize,
         min_score: f32,
+        max_docs: usize,
         timeout_seconds: f64,
         on_usage: Option<UsageCallback>,
         credential_id: i64,
@@ -439,6 +442,7 @@ impl OpenAIReranker {
             model: model.to_string(),
             top_n,
             min_score,
+            max_docs: max_docs.max(1),
             on_usage,
             credential_id,
         })
@@ -456,6 +460,34 @@ impl OpenAIReranker {
             return Ok(vec![]);
         }
         let top_n = top_n.unwrap_or(self.top_n);
+        // rerank 端点单次文档数上限（rerank_max_docs，默认 24）：
+        // 超限时分批串行调用，全局索引重排后统一截断——
+        // 分批不丢候选，只增加请求数。
+        if documents.len() > self.max_docs {
+            let mut all: Vec<(usize, f32)> = Vec::with_capacity(documents.len());
+            for chunk in documents.chunks(self.max_docs) {
+                let base = all.len(); // 本批在全局中的起始偏移
+                let part = self.rerank_once(query, chunk, None).await?;
+                all.extend(part.into_iter().map(|(i, s)| (i + base, s)));
+            }
+            all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            all.truncate(top_n);
+            return Ok(all);
+        }
+        self.rerank_once(query, documents, Some(top_n)).await
+    }
+
+    /// 单次 rerank 请求：返回 (局部索引, 分数)，top_n=None 时返回全部。
+    async fn rerank_once(
+        &self,
+        query: &str,
+        documents: &[String],
+        top_n: Option<usize>,
+    ) -> OceResult<Vec<(usize, f32)>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+        let top_n = top_n.unwrap_or(documents.len());
         let resp = self
             .http
             .post(&self.endpoint)

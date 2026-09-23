@@ -11,271 +11,15 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::collections::HashMap;
 
 // ───────────────────────────────────────────────────────── 读模型 DTO
+// DTO 已迁至 `oce_core::reports`（PG 实现共享）；本模块 re-export 保持旧路径可用。
 
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct ApiCallBucket {
-    pub ts: String,
-    pub count: u64,
-    pub error_count: u64,
-    pub avg_latency_ms: f64,
-    pub p50_latency_ms: i64,
-    pub p95_latency_ms: i64,
-    pub max_latency_ms: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct EndpointStat {
-    pub endpoint: String,
-    pub method: String,
-    pub count: u64,
-    pub error_count: u64,
-    pub error_rate: f64,
-    pub avg_latency_ms: f64,
-    pub p95_latency_ms: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct ErrorStat {
-    pub status_code: i64,
-    #[serde(default)]
-    pub error_type: Option<String>,
-    pub count: u64,
-    #[serde(default)]
-    pub last_ts: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ApiCallsReport {
-    pub window_hours: u32,
-    pub bucket: String,
-    #[serde(default)]
-    pub buckets: Vec<ApiCallBucket>,
-    #[serde(default)]
-    pub endpoints: Vec<EndpointStat>,
-    #[serde(default)]
-    pub errors: Vec<ErrorStat>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct RetrievalBucket {
-    pub ts: String,
-    pub count: u64,
-    pub empty_count: u64,
-    pub empty_rate: f64,
-    pub avg_hit_count: f64,
-    pub avg_total_ms: f64,
-    pub p95_total_ms: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct StageStat {
-    pub stage: String,
-    pub count: u64,
-    pub avg_ms: f64,
-    pub p95_ms: i64,
-    pub max_ms: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct IntentStat {
-    #[serde(default)]
-    pub intent: Option<String>,
-    pub count: u64,
-    pub empty_count: u64,
-    pub empty_rate: f64,
-    pub avg_total_ms: f64,
-    pub path_boosted_count: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct ScopeBucketStat {
-    pub label: String,
-    pub count: u64,
-    pub empty_rate: f64,
-    pub p95_total_ms: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RetrievalReport {
-    pub window_hours: u32,
-    pub bucket: String,
-    #[serde(default)]
-    pub buckets: Vec<RetrievalBucket>,
-    #[serde(default)]
-    pub stages: Vec<StageStat>,
-    #[serde(default)]
-    pub intents: Vec<IntentStat>,
-    #[serde(default)]
-    pub scopes: Vec<ScopeBucketStat>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct RetrievalQueryDetail {
-    pub ts: String,
-    pub source: String,
-    #[serde(default)]
-    pub query_text: Option<String>,
-    pub total_ms: i64,
-    pub hit_count: i64,
-    #[serde(default)]
-    pub scope_size: Option<i64>,
-    #[serde(default)]
-    pub intent: Option<String>,
-    #[serde(default)]
-    pub path_boosted: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct TokenBucket {
-    pub ts: String,
-    pub kind: String,
-    pub calls: u64,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct ModelTokenStat {
-    pub model: String,
-    pub kind: String,
-    pub calls: u64,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub avg_tokens_per_call: f64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct CredentialTokenStat {
-    #[serde(default)]
-    pub credential_id: Option<i64>,
-    pub calls: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TokensReport {
-    pub window_hours: u32,
-    pub bucket: String,
-    #[serde(default)]
-    pub buckets: Vec<TokenBucket>,
-    #[serde(default)]
-    pub models: Vec<ModelTokenStat>,
-    #[serde(default)]
-    pub credentials: Vec<CredentialTokenStat>,
-    pub tokens_total: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct CountStat {
-    pub key: String,
-    pub count: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct IndexInventoryReport {
-    pub blob_total: u64,
-    #[serde(default)]
-    pub blob_by_status: Vec<CountStat>,
-    #[serde(default)]
-    pub blob_by_language: Vec<CountStat>,
-    pub blob_retrying: u64,
-    pub blob_content_bytes: i64,
-    pub chunk_total: u64,
-    pub chunk_pending_embed: u64,
-    #[serde(default)]
-    pub chunk_by_type: Vec<CountStat>,
-    pub chunk_content_bytes: i64,
-    pub blob_chunk_links: u64,
-    pub symbol_total: u64,
-    #[serde(default)]
-    pub symbol_by_kind: Vec<CountStat>,
-    pub chain_total: u64,
-    pub chain_stale_7d: u64,
-    pub chain_stale_30d: u64,
-    pub staging_rows: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct ResourceBucket {
-    pub ts: String,
-    pub avg_cpu_percent: f64,
-    pub max_cpu_percent: f64,
-    pub avg_mem_percent: f64,
-    pub max_mem_rss_bytes: i64,
-    pub disk_data_bytes: i64,
-    pub disk_free_bytes: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ResourcesReport {
-    pub window_hours: u32,
-    pub bucket: String,
-    #[serde(default)]
-    pub buckets: Vec<ResourceBucket>,
-    pub disk_total_bytes: i64,
-    pub disk_growth_bytes_per_day: f64,
-    #[serde(default)]
-    pub disk_days_until_full: Option<f64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct TableSpaceStat {
-    pub table: String,
-    pub bytes: i64,
-    pub rows: i64,
-    pub approximate: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct DataFileStat {
-    pub name: String,
-    pub bytes: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct VectorCollectionStat {
-    pub name: String,
-    pub rows: u64,
-    pub est_bytes: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct VectorStoreStat {
-    pub mode: String,
-    #[serde(default)]
-    pub collections: Vec<VectorCollectionStat>,
-    pub file_bytes: i64,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-impl Default for VectorStoreStat {
-    fn default() -> Self {
-        Self {
-            mode: "unavailable".into(),
-            collections: Vec::new(),
-            file_bytes: 0,
-            error: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct StorageReport {
-    pub dialect: String,
-    pub total_table_bytes: i64,
-    #[serde(default)]
-    pub tables: Vec<TableSpaceStat>,
-    #[serde(default)]
-    pub data_dir: Option<String>,
-    #[serde(default)]
-    pub data_files: Vec<DataFileStat>,
-    pub data_dir_total_bytes: i64,
-    #[serde(default)]
-    pub vector: Option<VectorStoreStat>,
-}
+pub use oce_core::reports::{
+    ApiCallBucket, ApiCallsReport, CountStat, CredentialTokenStat, DataFileStat, EndpointStat,
+    ErrorStat, IndexInventoryReport, IntentStat, ModelTokenStat, ResourceBucket,
+    ResourcesReport, RetrievalBucket, RetrievalQueryDetail, RetrievalReport, ScopeBucketStat,
+    StageStat, StorageReport, TableSpaceStat, TokenBucket, TokensReport, VectorCollectionStat,
+    VectorStoreStat,
+};
 
 // ───────────────────────────────────────────────────────── 工具函数
 
@@ -1183,4 +927,79 @@ fn query_detail_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RetrievalQueryDet
         intent: r.get(6)?,
         path_boosted: r.get::<_, i64>(7)? != 0,
     })
+}
+
+#[async_trait::async_trait]
+impl oce_core::reports::ReportsStore for ReportsReader {
+    async fn api_calls(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> oce_core::error::OceResult<ApiCallsReport> {
+        ReportsReader::api_calls(self, window_hours, bucket)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn retrieval(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> oce_core::error::OceResult<RetrievalReport> {
+        ReportsReader::retrieval(self, window_hours, bucket)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn slow_queries(
+        &self,
+        window_hours: u32,
+        limit: u32,
+    ) -> oce_core::error::OceResult<Vec<RetrievalQueryDetail>> {
+        ReportsReader::slow_queries(self, window_hours, limit)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn empty_queries(
+        &self,
+        window_hours: u32,
+        limit: u32,
+    ) -> oce_core::error::OceResult<Vec<RetrievalQueryDetail>> {
+        ReportsReader::empty_queries(self, window_hours, limit)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn tokens(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> oce_core::error::OceResult<TokensReport> {
+        ReportsReader::tokens(self, window_hours, bucket)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn index_inventory(&self) -> oce_core::error::OceResult<IndexInventoryReport> {
+        ReportsReader::index_inventory(self)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn resources(
+        &self,
+        window_hours: u32,
+        bucket: &str,
+    ) -> oce_core::error::OceResult<ResourcesReport> {
+        ReportsReader::resources(self, window_hours, bucket)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
+
+    async fn storage(&self) -> oce_core::error::OceResult<StorageReport> {
+        ReportsReader::storage(self)
+            .await
+            .map_err(|e| oce_core::error::OceError::new(e, "ReportError"))
+    }
 }

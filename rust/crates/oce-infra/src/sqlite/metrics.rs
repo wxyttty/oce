@@ -3,7 +3,8 @@
 
 use crate::sqlite::SqlDb;
 use oce_core::metrics::{
-    ApiCallRecord, MetricsSink, ResourceSampleRecord, RetrievalMetricRecord, TokenUsageRecord,
+    ApiCallRecord, MetricsSink, MonitoringStats, ResourceSampleRecord, RetrievalMetricRecord,
+    TokenKindStats, TokenUsageRecord, ApiCallStats, RetrievalStats, ResourceSnapshot,
 };
 use std::sync::Mutex;
 
@@ -280,47 +281,9 @@ impl MetricsSink for SqlMetricsSink {
     }
 }
 
-/// /admin/stats 读模型。
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct MonitoringStats {
-    pub api_calls: ApiCallStats,
-    pub tokens: Vec<TokenKindStats>,
-    pub retrieval: RetrievalStats,
-    #[serde(default)]
-    pub resource: Option<ResourceSnapshot>,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct ApiCallStats {
-    pub calls: u64,
-    pub avg_latency_ms: f64,
-    pub error_count: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TokenKindStats {
-    pub kind: String,
-    pub model: String,
-    pub calls: u64,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct RetrievalStats {
-    pub count: u64,
-    pub empty_count: u64,
-}
-
-/// 最新资源快照（/admin/stats 的 resource 字段）。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ResourceSnapshot {
-    pub ts: String,
-    pub mem_rss_bytes: u64,
-    pub mem_percent: f64,
-    pub cpu_percent: f64,
-    pub disk_free_bytes: u64,
-    pub disk_total_bytes: u64,
-    pub disk_data_bytes: u64,
+#[async_trait::async_trait]
+impl oce_core::metrics::MonitoringStatsReader for SqlMetricsSink {
+    async fn stats(&self, window_hours: u32) -> oce_core::metrics::MonitoringStats {
+        SqlMetricsSink::stats(self, window_hours).await
+    }
 }

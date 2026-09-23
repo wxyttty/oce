@@ -3,8 +3,9 @@
 Python 版 [`src/oce`](../src/oce) 的 Rust 重写。目标：**能力对齐（ACE 兼容）+ 索引/查询性能提升**，
 个人模式存储引擎由「SQLite 元数据 + Milvus Lite 向量」迁移到 **TriviumDB**。
 
-> 当前状态：**个人模式全链路可用**（API/切块/索引/检索/凭据/监控/GC/CLI），
-> 52 个单元+集成测试全绿。服务模式（PostgreSQL/Redis/Milvus）留待后续阶段（见文末路线图）。
+> 当前状态：**个人模式 + 服务模式全链路可用**（API/切块/索引/检索/凭据/监控/GC/CLI）。
+> 服务模式：PostgreSQL 元数据（sqlx，schema 与 alembic head 逐列一致）+ Redis 队列
+> （Lua 去重防幽灵消息）+ 向量后端可选 TriviumDB（默认）或 pgvector（PG 一体化）。
 
 ## 快速开始
 
@@ -259,12 +260,54 @@ cargo test --workspace        # 52 个测试：单元 + TriviumDB 集成 + E2E +
 - `oce-app`：batch_upload → checkpoint → retrieve 全链路（假嵌入器）
 - `oce-server`：路由契约（鉴权/错误形状/凭据脱敏/409/400 语义/admin CRUD）
 
+## 服务模式
+
+服务模式面向多用户/多机共享索引：PostgreSQL 元数据 + Redis 任务队列 + 后台 worker。
+向量后端二选一：
+
+| 后端 | 配置 | 适用 |
+|---|---|---|
+| TriviumDB（默认） | `VECTOR_BACKEND=trivium` + `TRIVIUM_PATH` | 单进程部署；零额外容器 |
+| pgvector | `VECTOR_BACKEND=pgvector` | PG 一体化：向量与元数据同库同事务，pg_dump 单备份 |
+
+```bash
+# 编排启动（pgvector 镜像 + redis；无 etcd/minio/milvus）
+docker compose -f docker-compose.service.yml up -d
+
+# 或本机运行：依赖 docker-compose.dev.yml 的 postgres(25432)/redis(26379)
+./target/release/oce init --service --data-dir ~/.oce/data   # 生成服务模式 .env
+# 编辑 .env：DB_URL / REDIS_URL / EMBED_API_KEY / TRIVIUM_PATH
+./target/release/oce serve --data-dir ~/.oce/data
+```
+
+关键语义（与 Python 版对齐）：
+
+- **元数据 schema 逐列一致**：Rust 版幂等建表（`CREATE TABLE IF NOT EXISTS`），
+  Python alembic head 建的库可直接挂载，反之亦然
+- **队列**：Redis Lua 脚本原子去重（SADD pending → 新加才 LPUSH），防客户端
+  重复上传造成的幽灵消息；BLMOVE 处理中队列，崩溃残留启动时恢复
+- **worker**：`WORKER_ENABLED=true` 时容器装配即启动；消费 blob → 嵌入 → ack，
+  失败 retry_count++ 超限 mark_error
+- **模型指纹 fail-closed**：换嵌入模型（或维度）拒绝启动，提示重建索引——
+  trivium 走 `.tdb.model` sidecar，pgvector 走 `vector_index_meta` 表
+- **pgvector 已知限制**：无 BM25 词法混合（词法信号由 symbol_occurrences
+  exact 路承担）、HNSW 删除不收缩（膨胀靠 VACUUM 缓解）
+
+集成测试（需真实实例，`#[ignore]` 门控）：
+
+```bash
+OCE_PG_URL="postgres://oce:oce@localhost:25432/oce"   cargo test -p oce-infra --test pg_integration -- --ignored
+OCE_REDIS_URL="redis://:pass@localhost:26379/0"   cargo test -p oce-infra --test redis_queue_integration -- --ignored
+OCE_PG_URL="postgres://oce:oce@localhost:25432/oce"   cargo test -p oce-infra --test pgvector_integration -- --ignored
+```
+
 ## 阶段路线
 
 1. ✅ 领域核心 + 切块器（tree-sitter 23 语言，其余 RecursiveChunker 兜底）
 2. ✅ TriviumDB 存储 + SQLite 元数据 + 凭据运行时
 3. ✅ 检索编排 + 应用服务 + ACE API + CLI
 4. ✅ 集成测试 + 基准
-5. ⬜ 服务模式：`SqlxMetadataStore`（PostgreSQL）+ Redis 队列 + Milvus gRPC `VectorStore`
-6. ⬜ 性能跟进：符号提取并行化（rayon）、QuIVer 大库基准（≥1 万节点）
+5. ✅ 服务模式：PostgreSQL 元数据（sqlx）+ Redis 队列 + 向量后端
+   （trivium 默认 / pgvector 可选；端口抽象 Phase 0 完成）
+6. ⬜ 性能跟进：QuIVer 大库基准（≥1 万节点）、pgvector vs TriviumDB 检索质量 A/B
 7. ⬜ 数据迁移工具：Python 版 .env / db 文件兼容说明

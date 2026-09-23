@@ -12,6 +12,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
 triviumdb = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
@@ -35,3 +37,5 @@ tokenizers = "0.23"
 default = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dev-dependencies]

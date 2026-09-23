@@ -1,0 +1,80 @@
+# OpenContextEngine（Rust 版）服务模式编排：PostgreSQL(pgvector) + Redis。
+#
+# 与 Python 版 docker-compose.yml 的差异：
+# - 向量库默认 TriviumDB 单文件（挂载卷即可），无 etcd/minio/milvus 三个容器
+# - VECTOR_BACKEND=pgvector 时向量入 PG（pgvector 镜像），仍无独立向量服务
+# - 元数据建表由 Rust 进程幂等完成（SCHEMA_SQL），无 alembic 步骤
+#
+# 启动：docker compose -f docker-compose.service.yml up -d
+# 初始化：docker compose -f docker-compose.service.yml exec app oce init --service --data-dir /var/lib/oce
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: rust/Dockerfile
+    ports:
+      - "${OCE_PORT:-8986}:8986"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_URL: postgresql+asyncpg://oce:${POSTGRES_PASSWORD:-oce_dev}@postgres:5432/oce
+      REDIS_URL: redis://:${REDIS_PASSWORD:-oce_dev}@redis:6379/0
+      TRIVIUM_PATH: /var/lib/oce/oce.tdb
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-trivium}
+      WORKER_ENABLED: "${WORKER_ENABLED:-true}"
+    command:
+      [
+        "sh",
+        "-c",
+        "oce serve --data-dir /var/lib/oce --host 0.0.0.0 --port 8986",
+      ]
+    volumes:
+      - oce_data:/var/lib/oce
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    # pgvector 镜像：VECTOR_BACKEND=pgvector 时向量列可用；trivium 后端不受影响
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: oce
+      POSTGRES_USER: oce
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oce_dev}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oce -d oce"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "${REDIS_PASSWORD:-oce_dev}",
+      ]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-oce_dev}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  oce_data:
+  postgres_data:
+  redis_data:

@@ -60,6 +60,10 @@ pub struct RetrievalSettings {
     /// 内容从 chunk 行重构（缺行回退原样）；select 池加宽 8 条供合并缩窗
     /// 后回填（semble M1）。
     pub span_merge_enabled: bool,
+    /// rerank 候选池上限（RETRIEVAL_RERANK_POOL_K，默认 0=不截断）：
+    /// 向量召回 default_top_k 与 rerank 候选池解耦——大池保融合质量，
+    /// 小池让 reranker 集中在嵌入头部候选上（实测 24 池比 120 池 +2.8 分）。
+    pub rerank_pool_k: usize,
 }
 
 impl Default for RetrievalSettings {
@@ -92,6 +96,7 @@ impl Default for RetrievalSettings {
             broad_mode_enabled: false,
             meta_dir_penalty_enabled: false,
             span_merge_enabled: false,
+            rerank_pool_k: 0,
         }
     }
 }

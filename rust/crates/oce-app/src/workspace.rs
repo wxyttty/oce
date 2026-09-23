@@ -10,10 +10,9 @@
 
 use oce_core::error::{OceError, OceResult};
 use oce_core::formatter::{format_retrieval_with_notes, RetrievalNotes};
-use oce_core::indexing::{BlobRepository, IndexingPipeline};
+use oce_core::indexing::IndexingPipeline;
 use oce_core::retrieval::RetrievalPipeline;
 use oce_core::search::RetrievalAudit;
-use oce_infra::sqlite::repos::SqlBlobRepository;
 use oce_infra::sqlite::SqlDb;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -65,9 +64,9 @@ pub struct WorkspaceIndexer {
     root: PathBuf,
     indexing: Arc<IndexingPipeline>,
     retrieval: Arc<RetrievalPipeline>,
-    blob_repo: Arc<SqlBlobRepository>,
+    blob_repo: Arc<dyn oce_core::indexing::BlobRepository>,
     db: SqlDb,
-    trivium: oce_infra::trivium::TriviumHandle,
+    vector: Arc<dyn oce_core::search::VectorEngine>,
     /// 同步互斥（避免并发 search 触发双 sync）
     sync_lock: tokio::sync::Mutex<()>,
 }
@@ -77,9 +76,9 @@ impl WorkspaceIndexer {
         root: PathBuf,
         indexing: Arc<IndexingPipeline>,
         retrieval: Arc<RetrievalPipeline>,
-        blob_repo: Arc<SqlBlobRepository>,
+        blob_repo: Arc<dyn oce_core::indexing::BlobRepository>,
         db: SqlDb,
-        trivium: oce_infra::trivium::TriviumHandle,
+        vector: Arc<dyn oce_core::search::VectorEngine>,
     ) -> Self {
         Self {
             root,
@@ -87,7 +86,7 @@ impl WorkspaceIndexer {
             retrieval,
             blob_repo,
             db,
-            trivium,
+            vector,
             sync_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -313,8 +312,7 @@ impl WorkspaceIndexer {
     }
 
     async fn delete_blob(&self, blob_name: &str) -> OceResult<()> {
-        use oce_core::search::VectorIndex;
-        self.trivium.delete(&[blob_name.to_string()]).await?;
+        self.vector.delete(&[blob_name.to_string()]).await?;
         self.blob_repo.delete(blob_name).await?;
         Ok(())
     }
@@ -366,7 +364,7 @@ impl WorkspaceIndexer {
             workspace: self.root.display().to_string(),
             tracked_files: files.max(0) as usize,
             indexed_blobs: self.current_blob_names().await?.len(),
-            vector_nodes: self.trivium.node_count(),
+            vector_nodes: self.vector.node_count(),
         })
     }
 

@@ -576,5 +576,17 @@ impl PathSearchStore for TriviumStore {
 }
 
 /// 共享句柄：`Arc<TriviumStore>` 别名。trait 已直接实现在 TriviumStore 上，
-/// Arc 自动向 `Arc<dyn SearchStore/VectorIndex/PathSearchStore>` 强转。
+/// Arc 自动向 `Arc<dyn SearchStore/VectorIndex/PathSearchStore/VectorEngine>` 强转。
+impl oce_core::search::VectorStatsSource for TriviumStore {
+    fn node_count(&self) -> usize {
+        TriviumStore::node_count(self)
+    }
+
+    fn kind_stats(&self) -> Vec<(String, usize)> {
+        TriviumStore::kind_stats(self)
+    }
+}
+
+impl oce_core::search::VectorEngine for TriviumStore {}
+
 pub type TriviumHandle = Arc<TriviumStore>;

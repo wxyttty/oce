@@ -45,6 +45,23 @@ uv run pytest tests/unit/infrastructure/test_milvus3.py -q
 按文件粒度跑，让 Milvus Lite / tree-sitter 运行时在进程间释放；内存受限时勿在单进程里跑整个
 `tests/unit/infrastructure`。
 
+Rust 版（`rust/`，详见 `rust/README.md`）：
+
+```bash
+cd rust && cargo build --release -p oce-server
+./target/release/oce init --service --data-dir ~/.oce/data   # 服务模式 .env
+./target/release/oce serve --data-dir ~/.oce/data
+cargo test --workspace                                        # 单测 + e2e
+# 集成测试（需 docker-compose.dev.yml 的 postgres[pgvector]/redis）：
+OCE_PG_URL=postgres://oce:...@localhost:25432/oce cargo test -p oce-infra --test pg_integration -- --ignored
+OCE_REDIS_URL=redis://:...@localhost:26379/0 cargo test -p oce-infra --test redis_queue_integration -- --ignored
+OCE_PG_URL=... cargo test -p oce-infra --test pgvector_integration -- --ignored
+```
+
+Rust 服务模式：PostgreSQL 元数据（sqlx，schema 与 alembic head 逐列一致）+ Redis 队列
+（Lua 去重防幽灵消息）+ 向量后端 `VECTOR_BACKEND=trivium|pgvector`。编排用
+`docker-compose.service.yml`（pgvector + redis，无 etcd/minio/milvus）。
+
 ## 代码约束
 
 - 依赖管理只使用 `uv`；新增依赖先修改 `pyproject.toml`。
@@ -63,5 +80,6 @@ uv run pytest tests/unit/infrastructure/test_milvus3.py -q
 
 - Python 3.13.5，虚拟环境为根目录 `.venv`。
 - tree-sitter 锁定 `0.25.2`；`compat.py` 负责 API 快照和生命周期隔离。
-- `docker-compose.dev.yml` 提供服务模式依赖：PostgreSQL、Redis 和 Milvus 3.0。
+- `docker-compose.dev.yml` 提供服务模式依赖：PostgreSQL（pgvector 镜像）、Redis 和 Milvus 3.0。
+- Rust 版服务模式依赖同上（pgvector + redis）；Milvus 不需要（向量走 TriviumDB/pgvector）。
 - 临时密钥不得写入仓库、日志或评测报告。

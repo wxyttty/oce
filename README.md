@@ -166,6 +166,16 @@ host ports before running `uv run alembic upgrade head` and `uv run uvicorn`.
 The development file publishes PostgreSQL on `25432`, Redis on `26379`, and Milvus on
 `19530` by default.
 
+### Rust implementation
+
+The Rust port (`rust/`) also implements service mode with a lighter dependency
+footprint: PostgreSQL (metadata + optional pgvector vectors) and Redis only — no
+etcd/MinIO/Milvus containers. Use `docker-compose.service.yml` from the repository
+root, or see [`rust/README.md`](rust/README.md) for the full matrix
+(`VECTOR_BACKEND=trivium|pgvector`). The Rust server keeps the same ACE API surface,
+schema (column-compatible with Alembic head), and Redis queue semantics (Lua dedup,
+processing-queue recovery) as the Python implementation.
+
 You can also use the published image directly:
 
 ```powershell

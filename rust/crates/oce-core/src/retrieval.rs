@@ -575,6 +575,15 @@ impl RetrievalPipeline {
             )
         };
 
+        // rerank 候选池截断（RETRIEVAL_RERANK_POOL_K，默认 0=不截断）：
+        // 向量召回 default_top_k 与 rerank 池解耦——大池保融合质量，
+        // 小池让 reranker 集中在嵌入头部候选上。
+        let hits = if self.settings.rerank_pool_k > 0 && hits.len() > self.settings.rerank_pool_k {
+            hits.into_iter().take(self.settings.rerank_pool_k).collect()
+        } else {
+            hits
+        };
+
         let hits = {
             let _g = audit.as_deref_mut().map(|a| a.stage("rerank"));
             // rerank 冷却期内直接保序回退，不再打外部端点

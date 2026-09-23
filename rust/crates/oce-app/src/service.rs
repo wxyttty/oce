@@ -2,15 +2,13 @@
 //! 传输层只负责 DTO 映射，不编排业务流程。
 
 use oce_core::blob::Blob;
-use oce_core::chain::Chain;
+use oce_core::chain::{Chain, ChainRepository};
 use oce_core::error::{OceError, OceResult};
 use oce_core::formatter::format_retrieval_with_notes;
-use oce_core::indexing::{BlobRepository, IndexingPipeline};
+use oce_core::indexing::{classify_blob_status, BlobRepository, IndexingPipeline};
 use oce_core::metrics::{MetricsSink, RetrievalMetricRecord};
 use oce_core::retrieval::RetrievalPipeline;
-use oce_core::search::{search_hit_key, RetrievalAudit, SearchHit, VectorIndex};
-use oce_infra::sqlite::chains::classify_blob_status;
-use rusqlite;
+use oce_core::search::{search_hit_key, RetrievalAudit, SearchHit};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -53,36 +51,41 @@ pub struct CheckpointResult {
 pub struct RetrievalApplication {
     pub indexing: Arc<IndexingPipeline>,
     pub retrieval: Arc<RetrievalPipeline>,
-    pub blob_repo: Arc<oce_infra::sqlite::repos::SqlBlobRepository>,
-    pub chain_repo: Arc<oce_infra::sqlite::chains::SqlChainRepository>,
-    pub trivium: oce_infra::trivium::TriviumHandle,
-    pub metrics: Option<Arc<oce_infra::sqlite::metrics::SqlMetricsSink>>,
+    pub blob_repo: Arc<dyn BlobRepository>,
+    pub chain_repo: Arc<dyn ChainRepository>,
+    /// 向量引擎（写路径 delete + 统计；检索/写入主通道在 indexing/retrieval 管线内）
+    pub vector: Arc<dyn oce_core::search::VectorEngine>,
+    pub metrics: Option<Arc<dyn MetricsSink>>,
     /// 检索审计开关（monitoring.enabled && retrieval_audit_enabled，容器装配时定）
     pub retrieval_audit_enabled: bool,
     /// 是否落 query 原文（隐私敏感，默认关；开启后供慢查询/空回报表展示）
     pub store_query_text: bool,
+    /// 任务队列（服务模式 Redis；个人模式进程内；None=同步索引）
+    pub queue: Option<Arc<dyn oce_core::queue::Queue>>,
 }
 
 impl RetrievalApplication {
     pub fn new(
         indexing: Arc<IndexingPipeline>,
         retrieval: Arc<RetrievalPipeline>,
-        blob_repo: Arc<oce_infra::sqlite::repos::SqlBlobRepository>,
-        chain_repo: Arc<oce_infra::sqlite::chains::SqlChainRepository>,
-        trivium: oce_infra::trivium::TriviumHandle,
-        metrics: Option<Arc<oce_infra::sqlite::metrics::SqlMetricsSink>>,
+        blob_repo: Arc<dyn BlobRepository>,
+        chain_repo: Arc<dyn ChainRepository>,
+        vector: Arc<dyn oce_core::search::VectorEngine>,
+        metrics: Option<Arc<dyn MetricsSink>>,
         retrieval_audit_enabled: bool,
         store_query_text: bool,
+        queue: Option<Arc<dyn oce_core::queue::Queue>>,
     ) -> Self {
         Self {
             indexing,
             retrieval,
             blob_repo,
             chain_repo,
-            trivium,
+            vector,
             metrics,
             retrieval_audit_enabled,
             store_query_text,
+            queue,
         }
     }
 
@@ -91,7 +94,7 @@ impl RetrievalApplication {
         &self,
         blob_names: Vec<String>,
     ) -> OceResult<(Vec<String>, Vec<String>)> {
-        classify_blob_status(&self.blob_repo, blob_names).await
+        classify_blob_status(self.blob_repo.as_ref(), blob_names).await
     }
 
     /// 批量上传：ingest（轻量元数据）→ 同步 embed_pending（个人模式无队列）。
@@ -284,7 +287,7 @@ impl RetrievalApplication {
         blob_names: Vec<String>,
         checkpoint_id: Option<&str>,
     ) -> OceResult<(Vec<String>, Vec<String>, bool)> {
-        let (unknown, nonindexed) = classify_blob_status(&self.blob_repo, blob_names).await?;
+        let (unknown, nonindexed) = classify_blob_status(self.blob_repo.as_ref(), blob_names).await?;
         let mut checkpoint_not_found = false;
         if let Some(cid) = checkpoint_id.filter(|s| !s.is_empty()) {
             if let Some((chain_id, _)) = Chain::parse_checkpoint_token(cid) {
@@ -296,18 +299,24 @@ impl RetrievalApplication {
         Ok((unknown, nonindexed, checkpoint_not_found))
     }
 
-    /// GC：过期链删除 + 过期 blob 删除（dry_run 只统计）。
+    /// GC：过期链删除 + 过期 blob 删除（dry_run 只统计；在飞项跳过）。
     pub async fn run_gc(&self, ttl_days: u32, dry_run: bool, limit: usize) -> OceResult<GcResult> {
         let expired_chains = self.chain_repo.find_expired(ttl_days).await?;
         let expired_blobs = self.blob_repo.find_expired(ttl_days, limit).await?;
+        let inflight = self.inflight_set().await;
+        let deletable: Vec<&String> = expired_blobs
+            .iter()
+            .filter(|name| !inflight.contains(*name))
+            .collect();
+        let skipped_inflight = expired_blobs.len() - deletable.len();
         if dry_run {
             return Ok(GcResult {
                 dry_run: true,
                 ttl_days,
                 expired_chains: expired_chains.len(),
                 expired_blobs: expired_blobs.len(),
-                deletable_blobs: expired_blobs.len(),
-                skipped_inflight: 0,
+                deletable_blobs: deletable.len(),
+                skipped_inflight,
                 deleted_chains: 0,
                 deleted_blobs: 0,
             });
@@ -315,7 +324,7 @@ impl RetrievalApplication {
         for chain_id in &expired_chains {
             self.chain_repo.delete(chain_id).await?;
         }
-        for blob_name in &expired_blobs {
+        for blob_name in &deletable {
             self.delete_blob(blob_name).await?;
         }
         Ok(GcResult {
@@ -323,61 +332,89 @@ impl RetrievalApplication {
             ttl_days,
             expired_chains: expired_chains.len(),
             expired_blobs: expired_blobs.len(),
-            deletable_blobs: expired_blobs.len(),
-            skipped_inflight: 0,
+            deletable_blobs: deletable.len(),
+            skipped_inflight,
             deleted_chains: expired_chains.len(),
-            deleted_blobs: expired_blobs.len(),
+            deleted_blobs: deletable.len(),
         })
     }
 
     /// 删除 blob：向量 + 元数据 + 符号 + chunk 孤儿（与 DeleteBlobsCommandHandler 一致）。
     pub async fn delete_blob(&self, blob_name: &str) -> OceResult<()> {
-        self.trivium.delete(&[blob_name.to_string()]).await?;
+        self.vector.delete(&[blob_name.to_string()]).await?;
         self.blob_repo.delete(blob_name).await?;
         Ok(())
     }
 
     /// 查有 staging 但长时间未处理的 pending blob（requeue-stale 用）。
-    /// 返回数量；个人模式仅统计，不重复入队（无独立队列）。
-    pub async fn find_stale_with_staging(
-        &self,
-        stale_hours: i64,
-        limit: usize,
-    ) -> OceResult<usize> {
-        let db = self.blob_repo.db.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let cutoff = (chrono::Utc::now() - chrono::Duration::hours(stale_hours))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT b.blob_name FROM blobs b
-                         JOIN blob_staging s ON s.blob_name = b.blob_name
-                         WHERE b.status = 'pending' AND s.created_at < ?1 LIMIT ?2",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(rusqlite::params![cutoff, limit as i64], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .map_err(|e| e.to_string())?;
-                Ok(rows.filter_map(|r| r.ok()).count())
-            })
-        })
-        .await
-        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
-        result.map_err(|m| OceError::new(m, "SqliteError"))
+    /// 有队列时重新入队；无队列（同步索引模式）只返回条数。
+    pub async fn requeue_stale(&self, stale_hours: i64, limit: usize) -> OceResult<usize> {
+        let stale = self
+            .blob_repo
+            .find_stale_with_staging(stale_hours, limit)
+            .await?;
+        if let Some(queue) = &self.queue {
+            for blob_name in &stale {
+                queue.enqueue(blob_name).await?;
+            }
+        }
+        Ok(stale.len())
     }
 
-    /// 队列状态（个人模式无 Redis 队列：enabled=false）。
+    /// 队列状态（无队列：enabled=false，db_pending 仍真实）。
     pub async fn queue_status(&self) -> OceResult<QueueStatus> {
-        let pending = self.blob_repo.find_pending(None).await?;
-        Ok(QueueStatus {
-            enabled: false,
-            main_size: 0,
-            inflight: 0,
+        let pending = self.blob_repo.list_pending_names().await?;
+        match &self.queue {
+            None => Ok(QueueStatus {
+                enabled: false,
+                main_size: 0,
+                inflight: 0,
+                db_pending: pending.len(),
+            }),
+            Some(queue) => Ok(QueueStatus {
+                enabled: true,
+                main_size: queue.size().await? as usize,
+                inflight: queue.inflight_set().await?.len(),
+                db_pending: pending.len(),
+            }),
+        }
+    }
+
+    /// 重置队列，使其与 DB 的 pending blob 一致（对应 ResetQueueCommand）。
+    /// mode="purge" 清空重投；"sync" 以 DB 为准剔除无效项；requeue=false 只清理不投递。
+    pub async fn reset_queue(&self, mode: &str, requeue: bool) -> OceResult<QueueResetResult> {
+        let Some(queue) = &self.queue else {
+            return Ok(QueueResetResult::default());
+        };
+        let pending: std::collections::HashSet<String> =
+            self.blob_repo.list_pending_names().await?.into_iter().collect();
+        let removed = if mode == "purge" {
+            queue.purge().await? as usize
+        } else {
+            queue.retain(&pending).await? as usize
+        };
+        let mut requeued = 0usize;
+        if requeue {
+            let inflight = queue.inflight_set().await?;
+            for blob_name in pending.difference(&inflight) {
+                queue.enqueue(blob_name).await?;
+                requeued += 1;
+            }
+        }
+        Ok(QueueResetResult {
+            removed,
+            requeued,
+            queue_size: queue.size().await? as usize,
             db_pending: pending.len(),
         })
+    }
+
+    /// GC 跳过在飞项（与 Python GcCommandHandler 的 inflight 语义对齐）。
+    async fn inflight_set(&self) -> std::collections::HashSet<String> {
+        match &self.queue {
+            Some(queue) => queue.inflight_set().await.unwrap_or_default(),
+            None => std::collections::HashSet::new(),
+        }
     }
 }
 
@@ -398,6 +435,15 @@ pub struct QueueStatus {
     pub enabled: bool,
     pub main_size: usize,
     pub inflight: usize,
+    pub db_pending: usize,
+}
+
+/// reset_queue 结果（对应 Python ResetQueueResult）。
+#[derive(Debug, Default, serde::Serialize)]
+pub struct QueueResetResult {
+    pub removed: usize,
+    pub requeued: usize,
+    pub queue_size: usize,
     pub db_pending: usize,
 }
 

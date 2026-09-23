@@ -5,6 +5,7 @@
 //! checkpoint/gc/ingest/status/credentials 处理器、worker。
 
 pub mod container;
+pub mod queue;
 pub mod service;
 pub mod worker;
 pub mod workspace;

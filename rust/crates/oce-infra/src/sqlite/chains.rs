@@ -1,13 +1,11 @@
 //! Chain 仓储 + 精确标识符召回（SymbolSearchStore 语义）+ 首个 chunk 查询。
 //! 与 Python `sql_chain_repo.py` / `symbol_search_store.py` 对齐。
 
-use crate::sqlite::repos::SqlBlobRepository;
 use crate::sqlite::SqlDb;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use oce_core::chain::Chain;
 use oce_core::error::{OceError, OceResult};
-use oce_core::indexing::BlobRepository;
 use oce_core::search::{search_hit_key, ExactSearchStore, SearchHit};
 use std::collections::{HashMap, HashSet};
 
@@ -35,8 +33,12 @@ impl SqlChainRepository {
             members,
         })
     }
+}
 
-    pub async fn get(&self, chain_id: &str) -> OceResult<Option<Chain>> {
+/// ChainRepository 端口实现（方法体从 inherent impl 原样迁移）。
+#[async_trait]
+impl oce_core::chain::ChainRepository for SqlChainRepository {
+    async fn get(&self, chain_id: &str) -> OceResult<Option<Chain>> {
         let db = self.db.clone();
         let id = chain_id.to_string();
         run(db, move |conn| {
@@ -52,7 +54,7 @@ impl SqlChainRepository {
         .await
     }
 
-    pub async fn exists(&self, chain_id: &str) -> OceResult<bool> {
+    async fn exists(&self, chain_id: &str) -> OceResult<bool> {
         let db = self.db.clone();
         let id = chain_id.to_string();
         run(db, move |conn| {
@@ -68,7 +70,7 @@ impl SqlChainRepository {
     }
 
     /// 创建新链：chain_id = uuid4 hex（无连字符，与 Python 一致）。
-    pub async fn create(&self, members: Vec<String>) -> OceResult<Chain> {
+    async fn create(&self, members: Vec<String>) -> OceResult<Chain> {
         let db = self.db.clone();
         let mut unique: Vec<String> = members;
         unique.sort();
@@ -93,7 +95,7 @@ impl SqlChainRepository {
     }
 
     /// 应用 checkpoint：members − deleted ∪ added，version += 1。链不存在返回 None。
-    pub async fn apply_checkpoint(
+    async fn apply_checkpoint(
         &self,
         chain_id: &str,
         added: Vec<String>,
@@ -145,7 +147,7 @@ impl SqlChainRepository {
     }
 
     /// checkpoint 后 touch 链内全部 blob 的 last_seen。
-    pub async fn touch_members(&self, chain_id: &str) -> OceResult<()> {
+    async fn touch_members(&self, chain_id: &str) -> OceResult<()> {
         let db = self.db.clone();
         let id = chain_id.to_string();
         run(db, move |conn| {
@@ -160,7 +162,7 @@ impl SqlChainRepository {
         .await
     }
 
-    pub async fn delete(&self, chain_id: &str) -> OceResult<()> {
+    async fn delete(&self, chain_id: &str) -> OceResult<()> {
         let db = self.db.clone();
         let id = chain_id.to_string();
         run(db, move |conn| {
@@ -173,7 +175,7 @@ impl SqlChainRepository {
         .await
     }
 
-    pub async fn find_expired(&self, ttl_days: u32) -> OceResult<Vec<String>> {
+    async fn find_expired(&self, ttl_days: u32) -> OceResult<Vec<String>> {
         let db = self.db.clone();
         run(db, move |conn| {
             let threshold = (Utc::now() - Duration::days(ttl_days as i64))
@@ -475,34 +477,6 @@ impl oce_core::retrieval::FirstChunkLookup for SqlFirstChunkLookup {
         .await
         .map_err(|e| e.to_string())?
     }
-}
-
-/// `_classify` 的 blob 状态分类（find_missing / blob-status 共用）。
-pub async fn classify_blob_status(
-    repo: &SqlBlobRepository,
-    blob_names: Vec<String>,
-) -> OceResult<(Vec<String>, Vec<String>)> {
-    if blob_names.is_empty() {
-        return Ok((vec![], vec![]));
-    }
-    let exists = repo.exists_many(&blob_names).await?;
-    let unknown: Vec<String> = blob_names
-        .iter()
-        .filter(|n| !exists.get(*n).copied().unwrap_or(false))
-        .cloned()
-        .collect();
-    let existing: Vec<String> = blob_names
-        .iter()
-        .filter(|n| exists.get(*n).copied().unwrap_or(false))
-        .cloned()
-        .collect();
-    let blobs = repo.get_many(&existing).await?;
-    let nonindexed: Vec<String> = existing
-        .iter()
-        .filter(|n| blobs.get(*n).map(|b| !b.is_ready()).unwrap_or(true))
-        .cloned()
-        .collect();
-    Ok((unknown, nonindexed))
 }
 
 /// chunk 内容查询（跨 chunk/blob 联表）——LLM 重排等需要内容时使用。

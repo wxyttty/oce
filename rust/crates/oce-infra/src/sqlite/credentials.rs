@@ -1,77 +1,15 @@
 //! 凭据 admin 存储 + 凭据解析查询（对应 Python `credential_admin_store.py` +
 //! `credential_embedder._resolve_config`）。
 //!
+//! DTO 与端口在 `oce_core::credentials`；本模块是 SQLite 实现。
 //! 明文只落 model_credentials 表；响应与日志一律只暴露尾 4 位。
 
 use crate::sqlite::SqlDb;
+use async_trait::async_trait;
+use oce_core::credentials::{
+    hash_key, CredentialAdminStore, CredentialRecord, CredentialUpsert, RuntimeCredential,
+};
 use oce_core::error::{OceError, OceResult};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-/// 凭据视图（脱敏，对应 Python `CredentialRecord`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CredentialRecord {
-    pub id: i64,
-    pub kind: String,
-    pub provider: Option<String>,
-    pub name: String,
-    pub status: String,
-    pub priority: i64,
-    pub endpoint: Option<String>,
-    pub model: Option<String>,
-    pub timeout_seconds: i64,
-    pub rate_limit: Option<i64>,
-    pub note: Option<String>,
-    pub dimensions: Option<i64>,
-    pub max_batch_size: Option<i64>,
-    pub max_batch_chars: Option<i64>,
-    pub max_input_chars: Option<i64>,
-    pub input_overlap_chars: Option<i64>,
-    pub top_n: Option<i64>,
-    pub min_score: Option<f64>,
-    pub tpm_limit: Option<i64>,
-    pub max_candidates: Option<i64>,
-    pub output_top_k: Option<i64>,
-    pub snippet_chars: Option<i64>,
-    pub num_rewrites: Option<i64>,
-    pub api_key_last4: String,
-    pub last_used_at: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
-/// 创建/更新请求。更新语义：None 表示不改（api_key 提供则同步刷新 hash）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CredentialUpsert {
-    pub kind: Option<String>,
-    pub name: Option<String>,
-    pub api_key: Option<String>,
-    pub provider: Option<String>,
-    pub status: Option<String>,
-    pub priority: Option<i64>,
-    pub endpoint: Option<String>,
-    pub model: Option<String>,
-    pub timeout_seconds: Option<i64>,
-    pub rate_limit: Option<i64>,
-    pub note: Option<String>,
-    pub dimensions: Option<i64>,
-    pub max_batch_size: Option<i64>,
-    pub max_batch_chars: Option<i64>,
-    pub max_input_chars: Option<i64>,
-    pub input_overlap_chars: Option<i64>,
-    pub top_n: Option<i64>,
-    pub min_score: Option<f64>,
-    pub tpm_limit: Option<i64>,
-    pub max_candidates: Option<i64>,
-    pub output_top_k: Option<i64>,
-    pub snippet_chars: Option<i64>,
-    pub num_rewrites: Option<i64>,
-}
-
-pub fn hash_key(api_key: &str) -> String {
-    let digest = Sha256::digest(api_key.as_bytes());
-    hex::encode(digest)
-}
 
 const CREDENTIAL_COLS: &str = "id, kind, provider, name, status, priority, endpoint, model, timeout_seconds, rate_limit, note, dimensions, max_batch_size, max_batch_chars, max_input_chars, input_overlap_chars, top_n, min_score, tpm_limit, max_candidates, output_top_k, snippet_chars, num_rewrites, api_key, last_used_at, created_at, updated_at";
 
@@ -136,37 +74,16 @@ fn read_one(
     }
 }
 
-/// 运行时凭据（内部使用，含明文 key；响应与日志只暴露尾 4 位）。
-#[derive(Debug, Clone)]
-pub struct RuntimeCredential {
-    pub id: i64,
-    pub endpoint: String,
-    pub api_key: String,
-    pub model: String,
-    pub timeout_seconds: i64,
-    pub tpm_limit: Option<i64>,
-    pub max_candidates: Option<i64>,
-    pub output_top_k: Option<i64>,
-    pub snippet_chars: Option<i64>,
-    pub num_rewrites: Option<i64>,
-    pub top_n: Option<i64>,
-    pub min_score: Option<f64>,
-    /// embed 专属参数（其它 kind 恒为 None）
-    pub dimensions: Option<i64>,
-    pub max_batch_size: Option<i64>,
-    pub max_batch_chars: Option<i64>,
-    pub max_input_chars: Option<i64>,
-    pub input_overlap_chars: Option<i64>,
-}
-
-/// 凭据 admin CRUD（对应 Python `SqlCredentialAdminStore`）。
+/// 凭据 admin CRUD（对应 Python `SqlCredentialAdminStore`）；实现
+/// `oce_core::credentials::CredentialAdminStore`。
 #[derive(Clone)]
 pub struct SqlCredentialAdminStore {
     pub db: SqlDb,
 }
 
-impl SqlCredentialAdminStore {
-    pub async fn list(&self) -> OceResult<Vec<CredentialRecord>> {
+#[async_trait]
+impl CredentialAdminStore for SqlCredentialAdminStore {
+    async fn list(&self) -> OceResult<Vec<CredentialRecord>> {
         let db = self.db.clone();
         crate::run_sql_oce(db, move |conn| {
             let mut stmt = conn
@@ -181,12 +98,12 @@ impl SqlCredentialAdminStore {
         .await
     }
 
-    pub async fn get(&self, credential_id: i64) -> OceResult<Option<CredentialRecord>> {
+    async fn get(&self, credential_id: i64) -> OceResult<Option<CredentialRecord>> {
         let db = self.db.clone();
         crate::run_sql_oce(db, move |conn| read_one(conn, credential_id)).await
     }
 
-    pub async fn create(&self, data: CredentialUpsert) -> OceResult<CredentialRecord> {
+    async fn create(&self, data: CredentialUpsert) -> OceResult<CredentialRecord> {
         let db = self.db.clone();
         let data = data.clone();
         crate::run_sql_oce(db, move |conn| {
@@ -225,7 +142,7 @@ impl SqlCredentialAdminStore {
         .await
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         credential_id: i64,
         changes: CredentialUpsert,
@@ -284,7 +201,7 @@ impl SqlCredentialAdminStore {
         .await
     }
 
-    pub async fn delete(&self, credential_id: i64) -> OceResult<bool> {
+    async fn delete(&self, credential_id: i64) -> OceResult<bool> {
         let db = self.db.clone();
         crate::run_sql_oce(db, move |conn| {
             let n = conn
@@ -299,7 +216,7 @@ impl SqlCredentialAdminStore {
     }
 
     /// 复制源凭据：None 字段继承源行；省略 api_key 即复用源 key。
-    pub async fn duplicate(
+    async fn duplicate(
         &self,
         credential_id: i64,
         changes: CredentialUpsert,
@@ -353,7 +270,7 @@ impl SqlCredentialAdminStore {
 
     /// 解析 kind 专属运行时凭据：kind + active + endpoint/model 非空，
     /// 按 (priority, id) 升序取第一条；取不到返回 None（调用方回落 env）。
-    pub async fn resolve_active(&self, kind: &str) -> OceResult<Option<RuntimeCredential>> {
+    async fn resolve_active(&self, kind: &str) -> OceResult<Option<RuntimeCredential>> {
         let db = self.db.clone();
         let kind = kind.to_string();
         crate::run_sql_oce(db, move |conn| {

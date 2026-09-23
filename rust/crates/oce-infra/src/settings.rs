@@ -197,6 +197,8 @@ pub struct RerankSettings {
     pub model: String,
     pub top_n: usize,
     pub min_score: f32,
+    /// 单次 rerank 请求文档数上限：超过则分批串行，全局重排后截断
+    pub max_docs: usize,
     pub timeout_seconds: f64,
 }
 
@@ -210,6 +212,7 @@ impl RerankSettings {
             model: var("RERANK_MODEL").unwrap_or_else(|| "Qwen/Qwen3-Reranker-0.6B".into()),
             top_n: var_parse("RERANK_TOP_N", 10usize),
             min_score: var_parse("RERANK_MIN_SCORE", 0.05f32),
+            max_docs: var_parse("RERANK_MAX_DOCS", 24usize),
             timeout_seconds: var_parse("RERANK_TIMEOUT_SECONDS", 60.0f64),
         }
     }
@@ -316,6 +319,7 @@ impl RetrievalEnvSettings {
         );
         inner.span_merge_enabled =
             var_bool("RETRIEVAL_SPAN_MERGE_ENABLED", inner.span_merge_enabled);
+        inner.rerank_pool_k = var_parse("RETRIEVAL_RERANK_POOL_K", inner.rerank_pool_k);
         Self {
             inner,
             // 回落链：显式 RETRIEVAL_QUERY_REWRITE_MODEL > LLM_MODEL > 内置默认。
@@ -337,6 +341,36 @@ pub struct WorkerSettings {
     pub enabled: bool,
     pub concurrency: usize,
     pub max_retries: u32,
+}
+
+/// 向量后端选择：trivium（默认，单文件）| pgvector（PG 一体化，服务模式）。
+#[derive(Debug, Clone)]
+pub struct VectorBackendSettings {
+    pub backend: String,
+}
+
+impl VectorBackendSettings {
+    fn from_env() -> Self {
+        Self {
+            backend: var("VECTOR_BACKEND").unwrap_or_else(|| "trivium".into()),
+        }
+    }
+}
+
+/// Redis 配置（服务模式任务队列；个人模式不用）。
+#[derive(Debug, Clone)]
+pub struct RedisSettings {
+    pub url: String,
+    pub queue_name: String,
+}
+
+impl RedisSettings {
+    fn from_env() -> Self {
+        Self {
+            url: var("REDIS_URL").unwrap_or_else(|| "redis://localhost:6379/0".into()),
+            queue_name: var("REDIS_QUEUE_NAME").unwrap_or_else(|| "oce:embed_queue".into()),
+        }
+    }
 }
 
 impl WorkerSettings {
@@ -411,6 +445,8 @@ pub struct Settings {
     pub llm: LlmSettings,
     pub retrieval: RetrievalEnvSettings,
     pub worker: WorkerSettings,
+    pub redis: RedisSettings,
+    pub vector_backend: VectorBackendSettings,
     pub log: LogSettings,
     pub monitoring: MonitoringSettings,
     /// OCE 进程内存硬限制（MB），0=不限。超限时拒绝新嵌入请求并告警。
@@ -430,6 +466,8 @@ impl Settings {
             llm: LlmSettings::from_env(),
             retrieval: RetrievalEnvSettings::from_env(),
             worker: WorkerSettings::from_env(),
+            redis: RedisSettings::from_env(),
+            vector_backend: VectorBackendSettings::from_env(),
             log: LogSettings::from_env(),
             monitoring: MonitoringSettings::from_env(),
             memory_limit_mb: var_parse("OCE_MEMORY_LIMIT_MB", 0usize),

@@ -2,6 +2,29 @@
 //!
 //! 不变量：chain_id 必须是 UUID；version 单调递增；members 集合去重。
 
+use crate::error::OceResult;
+use async_trait::async_trait;
+
+/// Chain 仓储端口（infrastructure 实现；对应 Python `SqlChainRepository` 协议面）。
+#[async_trait]
+pub trait ChainRepository: Send + Sync {
+    async fn get(&self, chain_id: &str) -> OceResult<Option<Chain>>;
+    async fn exists(&self, chain_id: &str) -> OceResult<bool>;
+    async fn create(&self, members: Vec<String>) -> OceResult<Chain>;
+    /// 应用 checkpoint：members − deleted ∪ added，version += 1。链不存在返回 None。
+    async fn apply_checkpoint(
+        &self,
+        chain_id: &str,
+        added: Vec<String>,
+        deleted: Vec<String>,
+    ) -> OceResult<Option<u32>>;
+    /// checkpoint 后 touch 链内全部 blob 的 last_seen。
+    async fn touch_members(&self, chain_id: &str) -> OceResult<()>;
+    async fn delete(&self, chain_id: &str) -> OceResult<()>;
+    /// 按 updated_at 找过期链（GC 用）。
+    async fn find_expired(&self, ttl_days: u32) -> OceResult<Vec<String>>;
+}
+
 /// Chain 聚合根。
 #[derive(Debug, Clone)]
 pub struct Chain {

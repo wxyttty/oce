@@ -12,8 +12,7 @@ use axum::{
 };
 use oce_app::service::{BlobUpload, RetrievalApplication};
 use oce_core::error::OceError;
-use oce_core::metrics::MetricsSink;
-use oce_infra::sqlite::reports::{
+use oce_core::reports::{
     ApiCallsReport, IndexInventoryReport, ResourcesReport, RetrievalReport, StorageReport,
     TokensReport,
 };
@@ -187,7 +186,7 @@ async fn api_call_metrics_middleware(
     let started = std::time::Instant::now();
     let response = next.run(req).await;
     let status = response.status().as_u16();
-    if let Some(metrics) = &state.container.metrics {
+    if let Some(metrics) = &state.container.application.metrics {
         metrics.record_api_call(oce_core::metrics::ApiCallRecord {
             // 路由模板不可得时退化为请求路径（axum 0.8 无 route 模板暴露；
             // 个人模式端点少，路径即模板，无动态段）
@@ -339,7 +338,7 @@ async fn blob_status(
 // ── Admin 面 ──
 
 fn credential_to_response(
-    r: oce_infra::sqlite::credentials::CredentialRecord,
+    r: oce_core::credentials::CredentialRecord,
 ) -> CredentialResponse {
     CredentialResponse {
         id: r.id,
@@ -501,20 +500,20 @@ async fn admin_queue_status(
 async fn admin_queue_reset(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(_req): Json<QueueResetRequest>,
+    Json(req): Json<QueueResetRequest>,
 ) -> ApiResult<QueueResetResponse> {
     verify_admin_key(&headers, &state)?;
-    // 个人模式无独立队列：pending blob 数即 db_pending；队列本身为空
-    let status = state
+    // 与 DB pending 对齐（sync 剔除无效项 / purge 清空重投）；无队列时返回全零
+    let result = state
         .application
-        .queue_status()
+        .reset_queue(&req.mode, req.requeue)
         .await
         .map_err(|e| error_response(&e))?;
     Ok(Json(QueueResetResponse {
-        removed: 0,
-        requeued: 0,
-        queue_size: 0,
-        db_pending: status.db_pending,
+        removed: result.removed,
+        requeued: result.requeued,
+        queue_size: result.queue_size,
+        db_pending: result.db_pending,
     }))
 }
 
@@ -527,7 +526,7 @@ async fn admin_requeue_stale(
     // 查有 staging 但长时间未处理的 pending blob（与 Python find_stale_with_staging 一致）
     let stale = state
         .application
-        .find_stale_with_staging(req.stale_hours, req.limit)
+        .requeue_stale(req.stale_hours, req.limit)
         .await
         .map_err(|e| error_response(&e))?;
     Ok(Json(RequeueStaleResponse {
@@ -568,13 +567,13 @@ async fn admin_stats(
         .get("window_hours")
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
-    let Some(metrics) = &state.container.metrics else {
+    let Some(stats_reader) = &state.container.stats_reader else {
         return Ok(Json(MonitoringStatsResponse {
             window_hours,
             ..Default::default()
         }));
     };
-    let stats = metrics.stats(window_hours).await;
+    let stats = stats_reader.stats(window_hours).await;
     let tokens_total: u64 = stats.tokens.iter().map(|t| t.total_tokens).sum();
     let empty_rate = if stats.retrieval.count > 0 {
         stats.retrieval.empty_count as f64 / stats.retrieval.count as f64
@@ -654,43 +653,6 @@ fn report_params(params: &std::collections::HashMap<String, String>) -> (u32, St
     (window_hours, bucket)
 }
 
-fn reports_reader(state: &AppState) -> oce_infra::sqlite::reports::ReportsReader {
-    let container = &state.container;
-    // 向量库统计闭包：kind_stats 走属性索引，.tdb 文件体积直接 stat；
-    // 任何失败降级为 unavailable，绝不让报表抛错
-    let trivium = container.application.trivium.clone();
-    let tdb_path = container.settings.trivium.path.clone();
-    let dim = container.vector_dim;
-    let vector_stats = std::sync::Arc::new(move || {
-        let collections = trivium
-            .kind_stats()
-            .into_iter()
-            .map(
-                |(name, rows)| oce_infra::sqlite::reports::VectorCollectionStat {
-                    name,
-                    rows: rows as u64,
-                    est_bytes: 0,
-                },
-            )
-            .collect();
-        let file_bytes = std::fs::metadata(&tdb_path)
-            .map(|m| m.len() as i64)
-            .unwrap_or(0);
-        oce_infra::sqlite::reports::VectorStoreStat {
-            mode: "lite".into(),
-            collections,
-            file_bytes,
-            error: None,
-        }
-    });
-    oce_infra::sqlite::reports::ReportsReader::new(
-        container.db.clone(),
-        container.data_dir.clone(),
-        Some(vector_stats),
-        dim,
-    )
-}
-
 async fn report_api_calls(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -699,10 +661,10 @@ async fn report_api_calls(
     verify_admin_key(&headers, &state)?;
     let (window_hours, bucket) = report_params(&params);
     let bucket = validate_bucket(&bucket)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .api_calls(clamp_window(window_hours), &bucket)
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
@@ -714,10 +676,10 @@ async fn report_retrieval(
     verify_admin_key(&headers, &state)?;
     let (window_hours, bucket) = report_params(&params);
     let bucket = validate_bucket(&bucket)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .retrieval(clamp_window(window_hours), &bucket)
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
@@ -735,10 +697,10 @@ async fn report_slow_queries(
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
-    let items = reports_reader(&state)
+    let items = state.container.reports.as_ref()
         .slow_queries(clamp_window(window_hours), clamp_limit(limit))
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(serde_json::json!({
         "window_hours": clamp_window(window_hours),
         "items": items,
@@ -759,10 +721,10 @@ async fn report_empty_queries(
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
-    let items = reports_reader(&state)
+    let items = state.container.reports.as_ref()
         .empty_queries(clamp_window(window_hours), clamp_limit(limit))
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(serde_json::json!({
         "window_hours": clamp_window(window_hours),
         "items": items,
@@ -777,10 +739,10 @@ async fn report_tokens(
     verify_admin_key(&headers, &state)?;
     let (window_hours, bucket) = report_params(&params);
     let bucket = validate_bucket(&bucket)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .tokens(clamp_window(window_hours), &bucket)
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
@@ -789,10 +751,10 @@ async fn report_index_inventory(
     headers: HeaderMap,
 ) -> Result<Json<IndexInventoryReport>, Response> {
     verify_admin_key(&headers, &state)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .index_inventory()
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
@@ -804,10 +766,10 @@ async fn report_resources(
     verify_admin_key(&headers, &state)?;
     let (window_hours, bucket) = report_params(&params);
     let bucket = validate_bucket(&bucket)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .resources(clamp_window(window_hours), &bucket)
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
@@ -816,10 +778,10 @@ async fn report_storage(
     headers: HeaderMap,
 ) -> Result<Json<StorageReport>, Response> {
     verify_admin_key(&headers, &state)?;
-    let report = reports_reader(&state)
+    let report = state.container.reports.as_ref()
         .storage()
         .await
-        .map_err(|e| validation_error(&e))?;
+        .map_err(|e| error_response(&e))?;
     Ok(Json(report))
 }
 
