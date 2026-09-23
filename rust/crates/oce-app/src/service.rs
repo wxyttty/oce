@@ -107,23 +107,33 @@ impl RetrievalApplication {
         // ingest 并发：blob 间相互独立（内容寻址，无顺序依赖）。
         // PG 后端每次 ingest 是 3 个网络往返（get/save/staging），串行 32-blob
         // 批次 = ~100 RTT；SQLite 连接互斥下并发退化为串行，行为不变。
-        // 有界并发（8）：避免大仓库上传把 PG 连接池打满
-        let mut join_set = tokio::task::JoinSet::new();
-        for blob in blobs.iter() {
+        // 有界并发（8）：避免大仓库上传把 PG 连接池打满。
+        // 返回顺序必须与输入一致（ACE 兼容：客户端按位置对应上传文件），
+        // JoinSet 完成序无序——带下标收集后按输入序重排。
+        let mut join_set: tokio::task::JoinSet<(usize, OceResult<String>)> =
+            tokio::task::JoinSet::new();
+        for (idx, blob) in blobs.iter().enumerate() {
             let indexing = self.indexing.clone();
             let (path, content) = (blob.path.clone(), blob.content.clone());
             join_set.spawn(async move {
                 let blob_name = compute_blob_name(&path, &content);
-                indexing
+                let r = indexing
                     .ingest(&blob_name, &path, &content)
                     .await
-                    .map(|_| blob_name)
+                    .map(|_| blob_name);
+                (idx, r)
             });
         }
-        let mut names = Vec::with_capacity(blobs.len());
+        let mut names: Vec<Option<String>> = vec![None; blobs.len()];
         while let Some(res) = join_set.join_next().await {
-            names.push(res.map_err(|e| OceError::new(e.to_string(), "JoinError"))??);
+            let (idx, r) =
+                res.map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+            names[idx] = Some(r?);
         }
+        let names: Vec<String> = names
+            .into_iter()
+            .map(|n| n.expect("join_set 产出数与输入一致"))
+            .collect();
         let embedded_count = self.indexing.embed_pending(Some(&names), true).await?;
 
         let chunk_count = 0; // 异步模式：ingest 只写元数据，客户端轮询 ready

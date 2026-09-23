@@ -38,6 +38,29 @@ fn symbol_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"`[^`]+`|[a-z][a-z0-9]*_[a-z0-9_]+|\w+::\w+").unwrap())
 }
 
+/// 驼峰符号锚点：多词驼峰（RequestContext、SecureCookieSessionInterface）
+/// 与 $ 前缀（jQuery）独立构成符号信号——它们不会出现在纯路径题里。
+/// 单词驼峰（Flask、Python 这类专有名词）不在此列。
+fn camel_symbol_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+|\$[A-Za-z][A-Za-z0-9]+").unwrap()
+    })
+}
+
+/// 全大写缩写 + 紧邻符号语境词：缩写（XHR、HTTP、API、README、PEP）在
+/// 普通句子里太常见，必须伴随 ≤6 字符内的"定义/类/调用"等符号动作语境
+/// 才构成符号信号（"XHR 三种调用"✓，"核心 API）是哪个文件"✗）。
+fn abbr_symbol_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b[A-Z]{2,}[A-Z0-9]*\b[^\w]{0,6}(定义|实现|继承|调用|引用|声明|接口|结构体|函数|方法|字段|属性|枚举|类)",
+        )
+        .unwrap()
+    })
+}
+
 fn identifier_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -197,7 +220,11 @@ fn feature_markers_re() -> &'static Regex {
 /// 按意图分类查询，用于派发检索策略。
 pub fn classify_query_intent(query: &str) -> Intent {
     let query_lower = query.to_lowercase();
-    let has_symbol = symbol_pattern().is_match(query);
+    let has_symbol = symbol_pattern().is_match(query)
+        // 驼峰/缩写符号锚点：多词驼峰独立成立；全大写缩写需紧邻语境词
+        //（"RequestContext 类定义在哪" 是符号题，"README 说明文件" 不是）
+        || camel_symbol_pattern().is_match(query)
+        || abbr_symbol_pattern().is_match(query);
 
     // 分支1：有符号锚点
     if has_symbol {
@@ -235,6 +262,7 @@ pub fn classify_query_intent(query: &str) -> Intent {
 pub fn has_code_identifier(query: &str) -> bool {
     symbol_pattern().is_match(query)
 }
+
 
 /// 提取适合精确词法召回的代码标识符，保持查询中的出现顺序。
 pub fn extract_code_identifiers(query: &str) -> Vec<String> {
@@ -282,6 +310,39 @@ pub fn should_use_path_index(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn camel_and_abbr_symbol_anchors() {
+        // 多词驼峰 → Symbol
+        assert!(matches!(
+            classify_query_intent("RequestContext（请求上下文）类定义在哪个文件？"),
+            Intent::Symbol
+        ));
+        // $ 前缀 + 调用 → CallChain
+        assert!(matches!(
+            classify_query_intent("JavaScript 示例里前端 fetch/XHR/jQuery 三种调用与后端处理视图分别在哪里？"),
+            Intent::CallChain
+        ));
+        // 单词驼峰专有名词 + 无紧邻语境 → 不判符号（保持 Path/Feature）
+        assert!(!matches!(
+            classify_query_intent("Flask 项目的 Python 包配置文件在哪里？"),
+            Intent::Symbol
+        ));
+        // 全大写缩写无紧邻语境词 → 不判符号（README/API/PEP 是文件或泛指）
+        assert!(!matches!(
+            classify_query_intent("项目顶层的 README 说明文件是哪个？"),
+            Intent::Symbol
+        ));
+        assert!(!matches!(
+            classify_query_intent("Flask 包的入口模块（定义版本号并导出核心 API）是哪个文件？"),
+            Intent::Symbol
+        ));
+        assert!(!matches!(
+            classify_query_intent("标记 src/flask 为带类型信息分发包的 PEP 561 文件是哪个？"),
+            Intent::Symbol
+        ));
+    }
     use super::*;
 
     #[test]
