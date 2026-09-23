@@ -30,7 +30,8 @@ EMBED_API_KEY=sk-xxx ./target/release/oce serve --data-dir ~/.oce/data
 
 环境变量与 Python 版**完全兼容**（同前缀同语义：`API_KEY` / `EMBED_*` / `LLM_*` /
 `RETRIEVAL_*` / `MILVUS_DENSE_DIM` / `MONITORING_*`…），新增 `TRIVIUM_*` 前缀
-（`TRIVIUM_PATH` / `TRIVIUM_SYNC_MODE` / `TRIVIUM_STORAGE_MODE` / `TRIVIUM_AUTO_BUILD_QUIVER`）。
+（`TRIVIUM_PATH` / `TRIVIUM_SYNC_MODE` / `TRIVIUM_STORAGE_MODE` / `TRIVIUM_AUTO_BUILD_QUIVER`）
+与 `SQLITE_FTS_LEXICAL`（FTS5 词法混合路：off|gated 默认|full）。
 
 ## 工作区结构
 
@@ -121,6 +122,9 @@ rust/
       892ms → 9ms；static 嵌入自动跳过
 - [x] 意图分类器驼峰/缩写符号锚点：多词驼峰（RequestContext）独立成立，全大写
       缩写（XHR）需紧邻符号语境词——cc-switch +3.7 分（驼峰符号题密集受益）
+- [x] **FTS5 词法混合路**（个人模式，SQLITE_FTS_LEXICAL）：SQLite 真 BM25 与
+      dense RRF 融合——服务模式 pgvector tsvector 结论的反哺。引擎内 BM25
+      （AC 前缀噪声）默认关闭（TRIVIUM_TEXT_HYBRID 默认 false）
 - [x] PG 元数据写路径 UNNEST 批量化 + ingest 并发：stage1 595→383ms/批
 
 ## 性能
