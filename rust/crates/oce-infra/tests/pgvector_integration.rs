@@ -11,7 +11,7 @@ use oce_core::search::{
     PathDoc, PathSearchStore, SearchStore, VectorEngine, VectorIndex, VectorStatsSource,
     VectorUpsert,
 };
-use oce_infra::pgvector::PgVectorStore;
+use oce_infra::pgvector::{LexicalMode, PgVectorStore};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
@@ -53,7 +53,7 @@ async fn setup(tag: &str) -> Option<(PgPool, PgVectorStore, String)> {
         .execute(&pool)
         .await
         .expect("create vector extension");
-    let store = PgVectorStore::open(pool.clone(), "test-model dim=8 etext=v1".into())
+    let store = PgVectorStore::open(pool.clone(), "test-model dim=8 etext=v1".into(), LexicalMode::Off)
         .await
         .expect("open pgvector store");
     Some((pool, store, schema))
@@ -239,7 +239,7 @@ async fn model_fingerprint_fail_closed() {
         .unwrap();
 
     // 首次打开：写入指纹
-    let store = PgVectorStore::open(pool.clone(), "model-a dim=8 etext=v1".into())
+    let store = PgVectorStore::open(pool.clone(), "model-a dim=8 etext=v1".into(), LexicalMode::Off)
         .await
         .expect("first open");
     store
@@ -249,12 +249,12 @@ async fn model_fingerprint_fail_closed() {
     drop(store);
 
     // 同指纹：正常打开
-    PgVectorStore::open(pool.clone(), "model-a dim=8 etext=v1".into())
+    PgVectorStore::open(pool.clone(), "model-a dim=8 etext=v1".into(), LexicalMode::Off)
         .await
         .expect("same fingerprint");
 
     // 换模型：fail-closed
-    let err = PgVectorStore::open(pool.clone(), "model-b dim=8 etext=v1".into()).await;
+    let err = PgVectorStore::open(pool.clone(), "model-b dim=8 etext=v1".into(), LexicalMode::Off).await;
     match err {
         Err(msg) => assert!(
             msg.contains("指纹不匹配"),

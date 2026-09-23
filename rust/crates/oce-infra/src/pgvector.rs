@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
     content TEXT NOT NULL,
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
-    embedding vector({dim}) NOT NULL
+    embedding vector({dim}) NOT NULL,
+    tsv tsvector
 );
 CREATE INDEX IF NOT EXISTS idx_chunk_vectors_blob_name ON chunk_vectors (blob_name);
+CREATE INDEX IF NOT EXISTS idx_chunk_vectors_tsv ON chunk_vectors USING gin (tsv);
 CREATE INDEX IF NOT EXISTS idx_chunk_vectors_embedding
     ON chunk_vectors USING hnsw (embedding vector_cosine_ops);
 
@@ -71,18 +73,45 @@ CREATE TABLE IF NOT EXISTS vector_index_meta (
     )
 }
 
+/// 词法路模式（PGVECTOR_LEXICAL）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexicalMode {
+    /// 纯 dense（现状）。
+    Off,
+    /// 仅 query 里的代码标识符进 tsquery（对齐 TriviumDB 的标识符门控）。
+    Gated,
+    /// 全 query 文本进 tsquery（验证无门控词法路的价值）。
+    Full,
+}
+
+impl LexicalMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "full" => Self::Full,
+            _ => Self::Gated,
+        }
+    }
+}
+
 /// pgvector 向量引擎。
 pub struct PgVectorStore {
     pool: PgPool,
     /// 模型指纹（打开时校验，fail-closed）。
     model_fingerprint: String,
+    /// 词法路模式：off | gated（仅标识符）| full（全 query 文本）。
+    lexical: LexicalMode,
     /// node_count / kind_stats 缓存（写路径更新，读路径无锁快照）。
     stats_cache: Mutex<(usize, usize)>, // (chunk_count, path_count)
 }
 
 impl PgVectorStore {
     /// 打开（或初始化）pgvector 存储。模型指纹不匹配时 fail-closed。
-    pub async fn open(pool: PgPool, model_fingerprint: String) -> Result<Self, String> {
+    pub async fn open(
+        pool: PgPool,
+        model_fingerprint: String,
+        lexical: LexicalMode,
+    ) -> Result<Self, String> {
         // 扩展存在性检查（镜像 TriviumDB 维度校验的 fail-closed 风格）
         let has_ext: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')",
@@ -133,6 +162,7 @@ impl PgVectorStore {
         let store = Self {
             pool,
             model_fingerprint,
+            lexical,
             stats_cache: Mutex::new((0, 0)),
         };
         store.refresh_stats_cache().await;
@@ -186,12 +216,56 @@ fn dim_of(fingerprint: &str) -> usize {
         .unwrap_or(1024)
 }
 
+impl PgVectorStore {
+    /// 词法路的 tsquery 文本：gated 只取代码标识符（对齐 TriviumDB 门控），
+    /// full 传原文。返回 None 时跳过词法路（纯 dense）。
+    fn lexical_text(&self, query: &str) -> Option<String> {
+        match self.lexical {
+            LexicalMode::Off => None,
+            LexicalMode::Gated => {
+                let ids = oce_core::classifier::extract_code_identifiers(query);
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(ids.join(" "))
+                }
+            }
+            LexicalMode::Full => Some(query.to_string()),
+        }
+    }
+
+    /// ts_rank 词法检索（scope 过滤），返回 (content_hash, blob_name, rank)。
+    /// ts_rank 非 BM25（无 IDF/文档长度归一），但标识符精确匹配信号等价。
+    async fn lexical_search(
+        &self,
+        tsquery: &str,
+        allowed_blob_names: Option<&[String]>,
+        limit: usize,
+    ) -> OceResult<Vec<(String, String, f32)>> {
+        let (scope_sql, next_param) = Self::scope_clause(allowed_blob_names);
+        let sql = format!(
+            "SELECT content_hash, blob_name, ts_rank(tsv, query)::float4 AS rank
+             FROM chunk_vectors, plainto_tsquery('simple', $1) AS query
+             WHERE tsv @@ query{scope_sql}
+             ORDER BY rank DESC
+             LIMIT {limit}"
+        );
+        let mut q = sqlx::query_as::<_, (String, String, f32)>(&sql).bind(tsquery);
+        if next_param == 2 {
+            q = q.bind(allowed_blob_names.unwrap().to_vec());
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(pg_err)?;
+        Ok(rows)
+    }
+}
+
 #[async_trait]
 impl SearchStore for PgVectorStore {
     /// 余弦相似度检索（scope 过滤 + iterative_scan 缓解 HNSW 欠返回）。
+    /// 词法路开启时与 dense 做 RRF 融合（k=60，与 TriviumDB 混合检索同参）。
     async fn search(
         &self,
-        _query: &str,
+        query: &str,
         query_vector: &[f32],
         allowed_blob_names: Option<&[String]>,
         top_k: usize,
@@ -221,7 +295,7 @@ impl SearchStore for PgVectorStore {
             q = q.bind(allowed_blob_names.unwrap().to_vec());
         }
         let rows = q.fetch_all(&self.pool).await.map_err(pg_err)?;
-        Ok(rows
+        let mut hits: Vec<SearchHit> = rows
             .into_iter()
             .filter(|r| r.6 >= vector_threshold)
             .map(|(content_hash, blob_name, path, content, start_line, end_line, score)| {
@@ -235,7 +309,80 @@ impl SearchStore for PgVectorStore {
                     end_line: end_line.max(0) as u32,
                 }
             })
-            .collect())
+            .collect();
+
+        // 词法融合：RRF（rank/k+1）。词法命中补位 dense 未覆盖的 chunk。
+        // 融合 key = content_hash + blob_name（同内容 chunk 跨 blob 共享行，
+        // blob_name 区分作用域）。
+        if let Some(tsquery) = self.lexical_text(query) {
+            let lex = self
+                .lexical_search(&tsquery, allowed_blob_names, top_k.max(30))
+                .await?;
+            if !lex.is_empty() {
+                const RRF_K: f32 = 60.0;
+                let key = |h: &SearchHit| format!("{}\0{}", h.content_hash, h.blob_name);
+                let mut fused: std::collections::HashMap<String, f32> =
+                    std::collections::HashMap::new();
+                for (i, h) in hits.iter().enumerate() {
+                    fused.insert(key(h), 1.0 / (RRF_K + i as f32 + 1.0));
+                }
+                for (i, (hash, blob, _rank)) in lex.iter().enumerate() {
+                    *fused
+                        .entry(format!("{}\0{}", hash, blob))
+                        .or_insert(0.0) += 1.0 / (RRF_K + i as f32 + 1.0);
+                }
+                // 词法命中但 dense 未召回的 chunk：补查详情
+                let missing: Vec<(String, String)> = lex
+                    .iter()
+                    .map(|(h, b, _)| (h.clone(), b.clone()))
+                    .filter(|(h, b)| {
+                        !hits.iter().any(|x| x.content_hash == *h && x.blob_name == *b)
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    let hashes: Vec<String> = missing.iter().map(|(h, _)| h.clone()).collect();
+                    let mrows = sqlx::query_as::<
+                        _,
+                        (String, String, String, String, i32, i32),
+                    >(
+                        "SELECT content_hash, blob_name, path, content, start_line, end_line
+                         FROM chunk_vectors WHERE content_hash = ANY($1)",
+                    )
+                    .bind(&hashes)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(pg_err)?;
+                    for (content_hash, blob_name, path, content, sl, el) in mrows {
+                        // 只补 missing 集合内的行（ANY 可能命中同 hash 其他 blob）
+                        if !missing
+                            .iter()
+                            .any(|(h, b)| *h == content_hash && *b == blob_name)
+                        {
+                            continue;
+                        }
+                        hits.push(SearchHit {
+                            blob_name,
+                            path,
+                            content,
+                            score: 0.0,
+                            content_hash,
+                            start_line: sl.max(0) as u32,
+                            end_line: el.max(0) as u32,
+                        });
+                    }
+                }
+                // RRF 重排
+                hits.sort_by(|a, b| {
+                    fused
+                        .get(&key(b))
+                        .unwrap_or(&0.0)
+                        .partial_cmp(fused.get(&key(a)).unwrap_or(&0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                hits.truncate(limit);
+            }
+        }
+        Ok(hits)
     }
 }
 
@@ -250,14 +397,15 @@ impl VectorIndex for PgVectorStore {
         for item in &items {
             sqlx::query(
                 "INSERT INTO chunk_vectors
-                 (chunk_id, content_hash, blob_name, path, content, start_line, end_line, embedding)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector)
+                 (chunk_id, content_hash, blob_name, path, content, start_line, end_line, embedding, tsv)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, to_tsvector('simple', $5))
                  ON CONFLICT (chunk_id) DO UPDATE SET
                     content_hash = excluded.content_hash,
                     blob_name = excluded.blob_name,
                     path = excluded.path,
                     content = excluded.content,
                     start_line = excluded.start_line,
+                    tsv = excluded.tsv,
                     end_line = excluded.end_line,
                     embedding = excluded.embedding",
             )

@@ -347,12 +347,16 @@ pub struct WorkerSettings {
 #[derive(Debug, Clone)]
 pub struct VectorBackendSettings {
     pub backend: String,
+    /// pgvector 词法路模式：off（纯 dense）| gated（仅标识符，对齐 trivium
+    /// 门控）| full（全 query 文本进 tsquery——验证"无门控 BM25 是否有用"）。
+    pub lexical: String,
 }
 
 impl VectorBackendSettings {
     fn from_env() -> Self {
         Self {
             backend: var("VECTOR_BACKEND").unwrap_or_else(|| "trivium".into()),
+            lexical: var("PGVECTOR_LEXICAL").unwrap_or_else(|| "gated".into()),
         }
     }
 }

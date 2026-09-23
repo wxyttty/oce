@@ -630,7 +630,11 @@ impl Container {
             let pool = pg_pool
                 .clone()
                 .expect("pg mode"); // is_sqlite=false 时必然存在
-            let store = oce_infra::pgvector::PgVectorStore::open(pool, model_fingerprint)
+            let store = oce_infra::pgvector::PgVectorStore::open(
+                pool,
+                model_fingerprint,
+                oce_infra::pgvector::LexicalMode::parse(&settings.vector_backend.lexical),
+            )
                 .await
                 .map_err(|e| format!("pgvector 引擎初始化失败: {e}"))?;
             vector_engine = Arc::new(store);
