@@ -126,55 +126,70 @@ async fn insert_chunks_and_symbols(
     blob_name: &str,
     chunks: &[Chunk],
 ) -> OceResult<()> {
-    // 符号提取是正则密集的 CPU 工作：事务外并行预提取，事务内只做批量写入
+    // 符号提取是正则密集的 CPU 工作：事务外并行预提取，事务内只做批量写入。
+    // UNNEST 批量：逐条 INSERT 的网络往返是 PG 后端 stage1 的主要瓶颈
+    // （~1ms RTT × 数百条 = 数百 ms/批，实测比 SQLite 慢 10-100 倍）。
     let symbol_values = extract_symbols_parallel(chunks);
 
-    for chunk in chunks {
-        sqlx::query(
-            "INSERT INTO chunks (content_hash, content, content_size, chunk_type, embedded)
-             VALUES ($1, $2, $3, $4, false)
-             ON CONFLICT (content_hash) DO NOTHING",
-        )
-        .bind(&chunk.content_hash)
-        .bind(&chunk.content)
-        .bind(chunk.content.len() as i64)
-        .bind(&chunk.chunk_type)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_err)?;
-    }
-    for (identifier, kind, content_hash, start, end) in &symbol_values {
+    let hashes: Vec<String> = chunks.iter().map(|c| c.content_hash.clone()).collect();
+    let contents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let sizes: Vec<i64> = chunks.iter().map(|c| c.content.len() as i64).collect();
+    let types: Vec<Option<String>> = chunks.iter().map(|c| c.chunk_type.clone()).collect();
+    sqlx::query(
+        "INSERT INTO chunks (content_hash, content, content_size, chunk_type, embedded)
+         SELECT h, c, s, t, false FROM UNNEST($1::text[], $2::text[], $3::int8[], $4::text[])
+         AS t0(h, c, s, t)
+         ON CONFLICT (content_hash) DO NOTHING",
+    )
+    .bind(&hashes)
+    .bind(&contents)
+    .bind(&sizes)
+    .bind(&types)
+    .execute(&mut *tx)
+    .await
+    .map_err(pg_err)?;
+
+    if !symbol_values.is_empty() {
+        let sym_ids: Vec<String> = symbol_values.iter().map(|s| s.0.clone()).collect();
+        let sym_kinds: Vec<String> = symbol_values.iter().map(|s| s.1.clone()).collect();
+        let sym_hashes: Vec<String> = symbol_values.iter().map(|s| s.2.clone()).collect();
+        let sym_blob: Vec<String> = symbol_values.iter().map(|_| blob_name.to_string()).collect();
+        let sym_starts: Vec<i32> = symbol_values.iter().map(|s| s.3 as i32).collect();
+        let sym_ends: Vec<i32> = symbol_values.iter().map(|s| s.4 as i32).collect();
         sqlx::query(
             "INSERT INTO symbol_occurrences
              (identifier, blob_name, content_hash, kind, start_line, end_line)
-             VALUES ($1, $2, $3, $4, $5, $6)
+             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::int4[], $6::int4[])
              ON CONFLICT DO NOTHING",
         )
-        .bind(identifier)
-        .bind(blob_name)
-        .bind(content_hash)
-        .bind(kind)
-        .bind(*start)
-        .bind(*end)
+        .bind(&sym_ids)
+        .bind(&sym_blob)
+        .bind(&sym_hashes)
+        .bind(&sym_kinds)
+        .bind(&sym_starts)
+        .bind(&sym_ends)
         .execute(&mut *tx)
         .await
         .map_err(pg_err)?;
     }
-    for (index, chunk) in chunks.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO blob_chunks (blob_name, content_hash, start_line, end_line, chunk_index)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(blob_name)
-        .bind(&chunk.content_hash)
-        .bind(chunk.start_line as i32)
-        .bind(chunk.end_line as i32)
-        .bind(index as i32)
-        .execute(&mut *tx)
-        .await
-        .map_err(pg_err)?;
-    }
+
+    let bc_names: Vec<String> = chunks.iter().map(|_| blob_name.to_string()).collect();
+    let bc_starts: Vec<i32> = chunks.iter().map(|c| c.start_line as i32).collect();
+    let bc_ends: Vec<i32> = chunks.iter().map(|c| c.end_line as i32).collect();
+    let bc_indexes: Vec<i32> = (0..chunks.len() as i32).collect();
+    sqlx::query(
+        "INSERT INTO blob_chunks (blob_name, content_hash, start_line, end_line, chunk_index)
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::int4[], $4::int4[], $5::int4[])
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&bc_names)
+    .bind(&hashes)
+    .bind(&bc_starts)
+    .bind(&bc_ends)
+    .bind(&bc_indexes)
+    .execute(&mut *tx)
+    .await
+    .map_err(pg_err)?;
     Ok(())
 }
 
@@ -227,23 +242,34 @@ impl BlobRepository for PgBlobRepository {
         .execute(&mut *tx)
         .await
         .map_err(pg_err)?;
-        // chunks 非空时同步出现位置 + 符号（Python save_many 语义）
+        // chunks 非空时同步出现位置 + 符号（Python save_many 语义）。
+        // 批量 UNNEST：PG 网络往返 ~1ms/次，逐条 INSERT 在 32-blob 批次下
+        // 产生数百次 RTT（stage1 实测比 SQLite 慢 10-100 倍的主因）。
         if !blob.chunks.is_empty() {
-            for (index, chunk_ref) in blob.chunks.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO blob_chunks (blob_name, content_hash, start_line, end_line, chunk_index)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(&blob.blob_name)
-                .bind(&chunk_ref.content_hash)
-                .bind(chunk_ref.start_line as i32)
-                .bind(chunk_ref.end_line as i32)
-                .bind(index as i32)
-                .execute(&mut *tx)
-                .await
-                .map_err(pg_err)?;
-            }
+            let names: Vec<String> = blob
+                .chunks
+                .iter()
+                .map(|_| blob.blob_name.clone())
+                .collect();
+            let hashes: Vec<String> =
+                blob.chunks.iter().map(|c| c.content_hash.clone()).collect();
+            let starts: Vec<i32> =
+                blob.chunks.iter().map(|c| c.start_line as i32).collect();
+            let ends: Vec<i32> = blob.chunks.iter().map(|c| c.end_line as i32).collect();
+            let indexes: Vec<i32> = (0..blob.chunks.len() as i32).collect();
+            sqlx::query(
+                "INSERT INTO blob_chunks (blob_name, content_hash, start_line, end_line, chunk_index)
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::int4[], $4::int4[], $5::int4[])
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&names)
+            .bind(&hashes)
+            .bind(&starts)
+            .bind(&ends)
+            .bind(&indexes)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_err)?;
             let contents: Vec<(String, String)> = sqlx::query_as(
                 "SELECT content_hash, content FROM chunks WHERE content_hash = ANY($1)",
             )
@@ -277,19 +303,33 @@ impl BlobRepository for PgBlobRepository {
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            for (identifier, kind, content_hash, start, end) in &symbol_values {
+            if !symbol_values.is_empty() {
+                let sym_ids: Vec<String> =
+                    symbol_values.iter().map(|s| s.0.clone()).collect();
+                let sym_kinds: Vec<String> =
+                    symbol_values.iter().map(|s| s.1.clone()).collect();
+                let sym_hashes: Vec<String> =
+                    symbol_values.iter().map(|s| s.2.clone()).collect();
+                let sym_blob: Vec<String> = symbol_values
+                    .iter()
+                    .map(|_| blob.blob_name.clone())
+                    .collect();
+                let sym_starts: Vec<i32> =
+                    symbol_values.iter().map(|s| s.3 as i32).collect();
+                let sym_ends: Vec<i32> =
+                    symbol_values.iter().map(|s| s.4 as i32).collect();
                 sqlx::query(
                     "INSERT INTO symbol_occurrences
                      (identifier, blob_name, content_hash, kind, start_line, end_line)
-                     VALUES ($1, $2, $3, $4, $5, $6)
+                     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::int4[], $6::int4[])
                      ON CONFLICT DO NOTHING",
                 )
-                .bind(identifier)
-                .bind(&blob.blob_name)
-                .bind(content_hash)
-                .bind(kind)
-                .bind(*start)
-                .bind(*end)
+                .bind(&sym_ids)
+                .bind(&sym_blob)
+                .bind(&sym_hashes)
+                .bind(&sym_kinds)
+                .bind(&sym_starts)
+                .bind(&sym_ends)
                 .execute(&mut *tx)
                 .await
                 .map_err(pg_err)?;

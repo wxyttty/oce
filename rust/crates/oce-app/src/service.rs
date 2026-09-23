@@ -104,13 +104,25 @@ impl RetrievalApplication {
         blobs: Vec<BlobUpload>,
         checkpoint_id: Option<&str>,
     ) -> OceResult<BatchUploadResult> {
+        // ingest 并发：blob 间相互独立（内容寻址，无顺序依赖）。
+        // PG 后端每次 ingest 是 3 个网络往返（get/save/staging），串行 32-blob
+        // 批次 = ~100 RTT；SQLite 连接互斥下并发退化为串行，行为不变。
+        // 有界并发（8）：避免大仓库上传把 PG 连接池打满
+        let mut join_set = tokio::task::JoinSet::new();
+        for blob in blobs.iter() {
+            let indexing = self.indexing.clone();
+            let (path, content) = (blob.path.clone(), blob.content.clone());
+            join_set.spawn(async move {
+                let blob_name = compute_blob_name(&path, &content);
+                indexing
+                    .ingest(&blob_name, &path, &content)
+                    .await
+                    .map(|_| blob_name)
+            });
+        }
         let mut names = Vec::with_capacity(blobs.len());
-        for blob in &blobs {
-            let blob_name = compute_blob_name(&blob.path, &blob.content);
-            self.indexing
-                .ingest(&blob_name, &blob.path, &blob.content)
-                .await?;
-            names.push(blob_name);
+        while let Some(res) = join_set.join_next().await {
+            names.push(res.map_err(|e| OceError::new(e.to_string(), "JoinError"))??);
         }
         let embedded_count = self.indexing.embed_pending(Some(&names), true).await?;
 
