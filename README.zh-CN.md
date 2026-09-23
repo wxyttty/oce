@@ -163,6 +163,27 @@ docker pull ghcr.io/oce-ai/oce:latest
 `ghcr.io/oce-ai/oce:latest`，并提供下面三个服务连接配置：`DB_URL`、`REDIS_URL` 和
 `MILVUS_ENDPOINT`。镜像入口默认监听容器内的 `8986` 端口。
 
+### Rust 实现
+
+Rust 移植版（`rust/`）同样实现服务模式，且依赖更轻：仅需 PostgreSQL（元数据 +
+可选 pgvector 向量）与 Redis——不需要 etcd/MinIO/Milvus 容器。使用仓库根目录的
+`docker-compose.service.yml`，或查阅 [`rust/README.md`](rust/README.md) 了解完整
+后端矩阵（`VECTOR_BACKEND=trivium|pgvector`）。Rust 服务保持与 Python 版一致的
+ACE API 面、schema（与 alembic head 逐列兼容）和 Redis 队列语义（Lua 去重、
+处理队列恢复）。
+
+Rust 版独有的检索增强（oce-benchmark 200 题实测，Qwen3-Embedding-8B，
+无 LLM/重排档）：
+
+- **pgvector 词法混合路**（`PGVECTOR_LEXICAL`）：tsvector + ts_rank 与 dense
+  检索 RRF 融合——比纯 dense +2.8~3.3 分，追平 TriviumDB 的 BM25 混合且无其
+  引擎级 AC 前缀噪声
+- **查询嵌入缓存**：重复查询直接命中向量缓存（~400ms API 往返 → ~9ms）
+- **意图分类器驼峰符号锚点**：多词驼峰标识符（`RequestContext`）与
+  缩写+语境词（`XHR 三种调用`）正确判为符号/调用链查询——标识符密集仓 +3.7 分
+- **PG 元数据批量写**（UNNEST）与并发 ingest：PostgreSQL 后端 stage-1 索引
+  提速约 35%
+
 ### Admin 管理面板
 
 服务启动后可使用官方在线面板：<https://oce-ai.github.io/oce-admin>。

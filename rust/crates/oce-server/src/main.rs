@@ -149,6 +149,9 @@ DB_POOL_SIZE=10
 # VECTOR_BACKEND=trivium
 # trivium 后端：服务模式必须显式指定路径（无 SQLite 同目录推导）
 TRIVIUM_PATH=/var/lib/oce/oce.tdb
+# pgvector 词法混合路：off（纯 dense）| gated（默认，仅代码标识符进 tsquery）
+# | full（全查询文本）。ts_rank 与 dense 做 RRF 融合，实测 +2.8~3.3 分
+# PGVECTOR_LEXICAL=gated
 MILVUS_DENSE_DIM=1024
 # TRIVIUM_SYNC_MODE=normal
 # TRIVIUM_STORAGE_MODE=rom

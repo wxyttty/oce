@@ -5,7 +5,8 @@ Python 版 [`src/oce`](../src/oce) 的 Rust 重写。目标：**能力对齐（A
 
 > 当前状态：**个人模式 + 服务模式全链路可用**（API/切块/索引/检索/凭据/监控/GC/CLI）。
 > 服务模式：PostgreSQL 元数据（sqlx，schema 与 alembic head 逐列一致）+ Redis 队列
-> （Lua 去重防幽灵消息）+ 向量后端可选 TriviumDB（默认）或 pgvector（PG 一体化）。
+> （Lua 去重防幽灵消息）+ 向量后端可选 TriviumDB（默认）或 pgvector（PG 一体化，
+> 含 tsvector 词法混合路）。
 
 ## 快速开始
 
@@ -112,8 +113,15 @@ rust/
       移植：≤2 行间隔合并、<6 行补全、chunk 行重构缺行回退、池加宽回填；大库下
       覆盖选择器已防碎片化、基准面中性，受益面为小 scope 工作区，默认关）
 - [x] `oce doctor` 迁移/排障自检（只读，逐项报告 .env/SQLite/TriviumDB/嵌入提供方）
-- [ ] 服务模式：PostgreSQL（sqlx）、Redis 队列、Milvus gRPC 后端（trait 已留扩展点）
-- [ ] 资源采样器（sysinfo 磁盘/CPU 采样）、p50/p95 延迟聚合
+- [x] 服务模式：PostgreSQL 元数据（sqlx，schema 与 alembic head 逐列一致）、Redis
+      队列（Lua 去重 + BLMOVE + 崩溃恢复）、pgvector 向量后端（HNSW + 模型指纹
+      fail-closed + tsvector 词法路）
+- [x] 资源采样器（sysinfo 磁盘/CPU 采样）、p50/p95 延迟聚合
+- [x] 查询嵌入缓存（CachedEmbedder）：相同 query 向量直接命中，API 嵌入热查询
+      892ms → 9ms；static 嵌入自动跳过
+- [x] 意图分类器驼峰/缩写符号锚点：多词驼峰（RequestContext）独立成立，全大写
+      缩写（XHR）需紧邻符号语境词——cc-switch +3.7 分（驼峰符号题密集受益）
+- [x] PG 元数据写路径 UNNEST 批量化 + ingest 并发：stage1 595→383ms/批
 
 ## 性能
 
@@ -133,6 +141,7 @@ query avg 2.04 ms/查询（embed + 向量检索 top-50 + blob 过滤，dim=1024�
 
 | 配置 | flask Top-1 | flask nDCG@10 | flask 总分 | cc-switch Top-1 | cc-switch nDCG@10 | cc-switch 总分 |
 |---|---:|---:|---:|---:|---:|---:|
+| **Qwen3-8B + filedesc + 驼峰意图识别（2026-09 当前默认）** | **80%** | **0.878** | **83.9%** | **71%** | **0.820** | **76.5%** |
 | 静态多语言，无混合检索 | 39% | 0.567 | 47.8% | 28% | 0.342 | 31.1% |
 | 静态多语言 + BM25 混合，无 LLM | 52% | 0.686 | 60.3% | 28% | 0.371 | 32.5% |
 | potion-code-16M-v2 + 混合检索 | 41% | 0.597 | 50.3% | 23% | 0.317 | 27.3% |
@@ -145,7 +154,20 @@ query avg 2.04 ms/查询（embed + 向量检索 top-50 + blob 过滤，dim=1024�
 - LLM 层（rerank 为主，消融实测 rerank 单开即拿走几乎全部增益；rewrite 对跨语言查询 +0.15 nDCG；intent 单开为负收益）：flask +49.6 / cc +62.0 分
 - 消融细节：rerank 是唯一大杠杆；rewrite 价值在把相关文件拉进窗口（召回）；intent 分类错会带偏策略权重
 
-- BM25 混合检索（CJK 2-gram 词法兜底）是静态嵌入路线下的最大单项增益：flask +12.5 分，Top-1 +13
+- BM25 混合检索（CJK 2-gram 词法兜底）是静态嵌入路线下的最大单项增益：flask +12.5 分，Top-1 +13；
+  **但强嵌入（Qwen3-8B + filedesc）下增益归零**（开/关差 0.2 分）——词法精确信号被
+  强语义 + symbol_occurrences exact 路 + 文件描述注入覆盖。boost=1.0 反而 -2.3（噪声放大）。
+  源码级归因：triviumdb 内部已是 RRF(k=60)，其词法分 = search_ac 前缀展开 + BM25 求和
+  （引擎硬编码），短词 AC 命中海量节点稀释 sparse 排序头部——引擎级限制，app 层不可修。
+  强嵌入下 trivium 词法路正确用法：TRIVIUM_TEXT_HYBRID=false
+- **pgvector tsvector 词法路**（ts_rank + RRF，PGVECTOR_LEXICAL）：8B 下 +2.8~3.3 分——
+  ts_rank 无 AC 前缀展开，词匹配信号干净；full（无门控）不崩（RRF 排名域融合量纲不敏感，
+  trivium 加权融合无门控历史 -20 分）
+- **驼峰意图识别**（多词驼峰/缩写+语境词 → 符号锚点）：cc +3.7（驼峰符号题密集），
+  flask 持平（Q67 符号题修复 +1.37 / Q100 调用链题 -1.28 对冲）
+- **查询嵌入缓存**：热查询 892ms → 9ms（~100x），交互/MCP 重复查询场景
+- **PG 元数据批量写**：UNNEST 单语句批量（数百次 RTT → 3 次），stage1 595→383ms/批；
+  查询路径 PG 开销可忽略（exact 路 1.6ms，dense 437ms 是嵌入 API）
 - `potion-code-16M-v2` 英文字段名区分度最高但中文弱，整体不敌多语言模型——保持多语言默认
 - 三处 LLM 调用点（rerank/rewrite/intent）的模型回落链：显式设置 > LLM_MODEL > 内置默认，换模型不会局部失效
 - 召回预算（借鉴 semble_rs 实测校准）：default_top_k 50→120、per_query_top_k 20→60，
@@ -252,7 +274,7 @@ QuIVer ANN 实测结论（`oce-bench quiver`，Apple Silicon，dim=256）：
 ## 测试
 
 ```bash
-cargo test --workspace        # 52 个测试：单元 + TriviumDB 集成 + E2E + API 契约
+cargo test --workspace        # 141 个测试：单元 + TriviumDB 集成 + E2E + API 契约
 ```
 
 - `oce-core`：spans/切块器/分类器/规划器/选择器/formatter/symbol/chain/checkpoint 令牌
@@ -269,6 +291,11 @@ cargo test --workspace        # 52 个测试：单元 + TriviumDB 集成 + E2E +
 |---|---|---|
 | TriviumDB（默认） | `VECTOR_BACKEND=trivium` + `TRIVIUM_PATH` | 单进程部署；零额外容器 |
 | pgvector | `VECTOR_BACKEND=pgvector` | PG 一体化：向量与元数据同库同事务，pg_dump 单备份 |
+
+pgvector 词法混合路（`PGVECTOR_LEXICAL=off|gated|full`，默认 gated）：
+chunk 向量行带 tsvector 列（`simple` 配置 + GIN 索引），查询侧 ts_rank 检索与
+dense 做 RRF(k=60) 融合。gated 只喂代码标识符（对齐 trivium 门控），full 传
+全查询文本。8B API 嵌入实测（200 题）：off 154.3 → gated 157.1 → full 157.6。
 
 ```bash
 # 编排启动（pgvector 镜像 + redis；无 etcd/minio/milvus）
@@ -290,8 +317,8 @@ docker compose -f docker-compose.service.yml up -d
   失败 retry_count++ 超限 mark_error
 - **模型指纹 fail-closed**：换嵌入模型（或维度）拒绝启动，提示重建索引——
   trivium 走 `.tdb.model` sidecar，pgvector 走 `vector_index_meta` 表
-- **pgvector 已知限制**：无 BM25 词法混合（词法信号由 symbol_occurrences
-  exact 路承担）、HNSW 删除不收缩（膨胀靠 VACUUM 缓解）
+- **pgvector 已知限制**：ts_rank 非真 BM25（无 IDF/文档长度归一），但标识符
+  精确匹配信号等价（实测 +2.8~3.3 分）；HNSW 删除不收缩（膨胀靠 VACUUM 缓解）
 
 集成测试（需真实实例，`#[ignore]` 门控）：
 
@@ -310,8 +337,12 @@ OCE_PG_URL="postgres://oce:oce@localhost:25432/oce"   cargo test -p oce-infra --
 5. ✅ 服务模式：PostgreSQL 元数据（sqlx）+ Redis 队列 + 向量后端
    （trivium 默认 / pgvector 可选；端口抽象 Phase 0 完成）
 6. ✅ pgvector vs TriviumDB 检索质量 A/B（nollm 档，Qwen3-8B API 嵌入）：
-   双仓合计 154.3 vs 156.6（差 2.3 分，噪声带边缘）——质量持平，pgvector 达到
-   服务模式可用标准；默认仍 trivium（零依赖），pgvector 为 PG 一体化一等选项。
+   纯 dense 154.3 vs 156.6（持平）；pgvector 开 tsvector 词法路（gated）后
+   157.1——**反超 trivium**。归因实验：trivium 内部已是 RRF(k=60)，其 BM25
+   零增益根因是引擎词法分 = AC 前缀展开 + BM25 求和（噪声稀释 sparse 排序），
+   强嵌入下正确用法是 TRIVIUM_TEXT_HYBRID=false；词法增益由 pgvector
+   tsvector 路或 symbol_occurrences exact 路承担。默认仍 trivium（零依赖），
+   pgvector 为 PG 一体化一等选项。
    详见 oce-benchmark/results/ab-pgvector-vs-trivium-nollm.md
    ⬜ QuIVer 大库基准（≥1 万节点）
 7. ⬜ 数据迁移工具：Python 版 .env / db 文件兼容说明

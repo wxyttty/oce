@@ -176,6 +176,20 @@ root, or see [`rust/README.md`](rust/README.md) for the full matrix
 schema (column-compatible with Alembic head), and Redis queue semantics (Lua dedup,
 processing-queue recovery) as the Python implementation.
 
+Notable Rust-only retrieval work (measured on the 200-question oce-benchmark suite,
+Qwen3-Embedding-8B, no LLM/rerank):
+
+- **pgvector lexical hybrid** (`PGVECTOR_LEXICAL`): tsvector + ts_rank fused with
+  dense retrieval via RRF — +2.8~3.3 points over pure dense, matching TriviumDB's
+  BM25 hybrid without its engine-level AC-prefix noise.
+- **Query embedding cache**: repeated queries hit the vector cache directly
+  (~400ms API round-trip → ~9ms).
+- **CamelCase symbol anchors** in the intent classifier: multi-word CamelCase
+  identifiers (`RequestContext`) and abbreviation+context (`XHR 三种调用`) now
+  classify as symbol/call-chain queries — +3.7 points on identifier-heavy repos.
+- **Batched PG metadata writes** (UNNEST) and concurrent ingest: ~35% faster
+  stage-1 indexing on the PostgreSQL backend.
+
 You can also use the published image directly:
 
 ```powershell
