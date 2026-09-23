@@ -32,3 +32,4 @@ pub(crate) async fn run_sql_oce<T: Send + 'static>(
     .await
     .map_err(|e| oce_core::error::OceError::new(e.to_string(), "JoinError"))?
 }
+

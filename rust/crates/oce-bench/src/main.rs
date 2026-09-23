@@ -287,6 +287,7 @@ async fn main() {
             // TriviumDB 写入
             let tdb = Arc::new(
                 oce_infra::trivium::TriviumStore::open(oce_infra::settings::TriviumSettings {
+            fts_lexical: "off".into(),
                     path: tdb_path.to_string_lossy().into_owned(),
                     sync_mode: "off".into(),
                     storage_mode: "rom".into(),
@@ -368,6 +369,7 @@ async fn main() {
             let (results, _chars, _chunk_elapsed) = chunk_dir(&dir, 10_000);
             let tdb = Arc::new(
                 oce_infra::trivium::TriviumStore::open(oce_infra::settings::TriviumSettings {
+            fts_lexical: "off".into(),
                     path: tdb_path.to_string_lossy().into_owned(),
                     sync_mode: "off".into(),
                     storage_mode: "rom".into(),
@@ -472,6 +474,7 @@ async fn quiver_bench(nodes: usize, dim: usize, n: usize) {
 
     let tdb = Arc::new(
         oce_infra::trivium::TriviumStore::open(oce_infra::settings::TriviumSettings {
+            fts_lexical: "off".into(),
             path: dir.join("quiver.tdb").to_string_lossy().into_owned(),
             sync_mode: "off".into(),
             storage_mode: "rom".into(),

@@ -33,11 +33,28 @@ pub struct TriviumStore {
     text_hybrid: bool,
     /// SA-PPR 图扩散深度（0=关闭；需节点间边才有意义）
     expand_depth: usize,
+    /// FTS5 词法混合路（个人模式）：None = 关闭（无 SQLite 或开关 off）。
+    /// trivium 引擎内 BM25 的 AC 前缀噪声已实测归零（强嵌入下），
+    /// FTS5 bm25 是干净词匹配——服务模式 pgvector ts_rank 路结论的复刻。
+    lexical: Option<crate::sqlite::fts_lexical::FtsLexical>,
+    /// 词法路模式：gated（仅标识符，默认）| full（全查询文本）
+    lexical_full: bool,
 }
 
 impl TriviumStore {
     fn w(&self) -> std::sync::RwLockWriteGuard<'_, Database<f32>> {
         self.db.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 注入 FTS5 词法路（个人模式装配时调用；full=true 传全查询文本）。
+    pub fn with_fts_lexical(
+        mut self,
+        fts: crate::sqlite::fts_lexical::FtsLexical,
+        full: bool,
+    ) -> Self {
+        self.lexical = Some(fts);
+        self.lexical_full = full;
+        self
     }
 
     fn r(&self) -> std::sync::RwLockReadGuard<'_, Database<f32>> {
@@ -77,6 +94,8 @@ impl TriviumStore {
             settings,
             text_hybrid,
             expand_depth,
+            lexical: None,
+            lexical_full: false,
         };
         // kind/blob_name/identifier 属性索引：O(1) 前置过滤
         Ok(store)
@@ -335,7 +354,57 @@ impl TriviumStore {
                 &config,
             )
             .map_err(|e| e.to_string())?;
-        Ok(hits.into_iter().filter_map(payload_to_hit).collect())
+        let mut out: Vec<(SearchHit, f32)> =
+            hits.into_iter().filter_map(payload_to_hit).collect();
+
+        // FTS5 词法融合（个人模式）：bm25 与 dense 排名做 RRF(k=60)。
+        // 词法命中但 dense 未召回的 chunk 由 payload 缺 content——FTS 行有
+        // hash/blob，内容从 FTS 行直接取（chunk_fts.content 冗余存储）。
+        // 仅 KIND_CHUNK 参与；失败静默跳过（词法路是增强，不阻断主链路）。
+        if kind == KIND_CHUNK {
+            if let Some(fts) = &self.lexical {
+                let lex_text: Option<String> = if self.lexical_full {
+                    query_text.map(|q| q.to_string())
+                } else {
+                    lexical_query.clone()
+                };
+                if let Some(lq) = lex_text {
+                    if let Ok(lex_hits) = fts.search(&lq, blob_filter, top_k.max(30)) {
+                        if !lex_hits.is_empty() {
+                            const RRF_K: f32 = 60.0;
+                            let key = |h: &(SearchHit, f32)| {
+                                format!("{}\0{}", h.0.content_hash, h.0.blob_name)
+                            };
+                            let mut fused: std::collections::HashMap<String, f32> =
+                                std::collections::HashMap::new();
+                            for (i, h) in out.iter().enumerate() {
+                                fused.insert(key(h), RRF_K / (RRF_K + i as f32 + 1.0));
+                            }
+                            for (i, lh) in lex_hits.iter().enumerate() {
+                                *fused
+                                    .entry(format!("{}\0{}", lh.content_hash, lh.blob_name))
+                                    .or_insert(0.0) += RRF_K / (RRF_K + i as f32 + 1.0);
+                            }
+                            // 补位 hit 的 path/行号缺失会污染下游
+                            // （source priority 降权 + formatter 空路径），
+                            // 且挤占 dense 命中名额——只重排不补位。
+                            // 词法增益的主体是排序信号（RRF）；召回补位
+                            // 需 JOIN blob_chunks 补全元数据，收益待证。
+                            // RRF 重排
+                            out.sort_by(|a, b| {
+                                fused
+                                    .get(&key(b))
+                                    .unwrap_or(&0.0)
+                                    .partial_cmp(fused.get(&key(a)).unwrap_or(&0.0))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            out.truncate(top_k.max(30));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// 路径文档 upsert：path_id 确定性派生节点 ID。

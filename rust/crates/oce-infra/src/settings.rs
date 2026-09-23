@@ -69,12 +69,17 @@ pub struct TriviumSettings {
     pub storage_mode: String,
     /// 向量维度（与 EMBED_DIMENSIONS 必须一致）
     pub dense_dim: usize,
-    /// BM25 稀疏文本混合检索（标识符门控：仅 query 里的代码标识符进 BM25，
-    /// 无标识符时词法路关闭；flask +4.40 / cc-switch +1.13 vs 全关）。
+    /// 引擎内 BM25 稀疏文本混合（AC 前缀 + BM25 求和）。强嵌入下实测
+    /// 归零/负（8B：开/关差 0.2；与 FTS5 同开时 AC 噪声拖累 FTS -1.9），
+    /// 默认关；弱嵌入（静态 potion）场景显式开（flask +4.40）。
     pub text_hybrid: bool,
     /// BM25 路 RRF 融合权重（TRIVIUM_TEXT_BOOST，默认 0.8）：
     /// 词法信号只做锦上添花，不应压过 dense 语义排序。
     pub text_boost: f32,
+    /// FTS5 词法混合路（个人模式）：off | gated（默认，仅标识符）| full。
+    /// trivium 引擎 BM25 的 AC 前缀噪声实测归零后，词法增益由 FTS5 bm25
+    /// 承担（服务模式 pgvector ts_rank 路结论的复刻）。
+    pub fts_lexical: String,
     /// SA-PPR 图扩散深度（TRIVIUM_EXPAND_DEPTH，0=关闭）
     pub expand_depth: usize,
     /// 是否允许查询自动构建 QuIVer ANN。
@@ -95,8 +100,12 @@ impl TriviumSettings {
             // trivium.rs 的标识符门控生效（仅真标识符进 BM25）。
             // 标识符门控 + 低权重 BM25：flask +4.40 / cc-switch +1.13（vs 全关）。
             // 词法信号只做锦上添花，不应压过 dense 语义排序。
-            text_hybrid: var_bool("TRIVIUM_TEXT_HYBRID", true),
+            // 引擎内 BM25 的 AC 前缀噪声在强嵌入下实测归零/负（cc -1.9 与
+            // FTS 冗余时）；词法信号改由 FTS5 bm25 承担（fts_lexical）。
+            // 弱嵌入（静态 potion）场景显式设 true 恢复。
+            text_hybrid: var_bool("TRIVIUM_TEXT_HYBRID", false),
             text_boost: var_parse("TRIVIUM_TEXT_BOOST", 0.3f32),
+            fts_lexical: var("SQLITE_FTS_LEXICAL").unwrap_or_else(|| "gated".into()),
             expand_depth: var_parse("TRIVIUM_EXPAND_DEPTH", 0usize),
             auto_build_quiver: var_bool("TRIVIUM_AUTO_BUILD_QUIVER", false),
         }

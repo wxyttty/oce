@@ -9,6 +9,7 @@ fn temp_tdb(tag: &str) -> TriviumSettings {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     TriviumSettings {
+        fts_lexical: "off".into(),
         path: dir.join("test.tdb").to_string_lossy().into_owned(),
         sync_mode: "off".into(),
         storage_mode: "rom".into(),

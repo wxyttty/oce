@@ -124,6 +124,24 @@ fn insert_chunks_and_symbols(
             ])
             .map_err(|e| e.to_string())?;
     }
+    // FTS5 词法行（(hash, blob) 粒度，先删后插保证幂等）。
+    // 词法混合路关闭时也维护——开关只影响读路径，避免开关切换需重建索引。
+    let mut stmt_fts_del = tx
+        .prepare_cached("DELETE FROM chunk_fts WHERE content_hash = ?1 AND blob_name = ?2")
+        .map_err(|e| e.to_string())?;
+    let mut stmt_fts_ins = tx
+        .prepare_cached(
+            "INSERT INTO chunk_fts (content, content_hash, blob_name) VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|e| e.to_string())?;
+    for chunk in chunks {
+        stmt_fts_del
+            .execute(rusqlite::params![chunk.content_hash, blob_name])
+            .map_err(|e| e.to_string())?;
+        stmt_fts_ins
+            .execute(rusqlite::params![chunk.content, chunk.content_hash, blob_name])
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -359,6 +377,8 @@ impl BlobRepository for SqlBlobRepository {
                     [&name],
                 )
                 .map_err(|e| e.to_string())?;
+                conn.execute("DELETE FROM chunk_fts WHERE blob_name = ?1", [&name])
+                    .map_err(|e| e.to_string())?;
                 for hash in &hashes {
                     conn.execute(
                         "DELETE FROM chunks WHERE content_hash = ?1

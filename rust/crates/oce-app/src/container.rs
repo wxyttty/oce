@@ -707,6 +707,16 @@ impl Container {
                         tdb_settings.path
                     )
                 })?;
+            // FTS5 词法混合路（个人模式）：SQLite 元数据在场且开关非 off 时注入。
+            // gated（默认）只喂代码标识符，full 传全查询文本。
+            let trivium_store = match &db {
+                None => trivium_store,
+                Some(sql_db) if tdb_settings.fts_lexical == "off" => trivium_store,
+                Some(sql_db) => {
+                    let fts = oce_infra::sqlite::fts_lexical::FtsLexical::new(sql_db.clone());
+                    trivium_store.with_fts_lexical(fts, tdb_settings.fts_lexical == "full")
+                }
+            };
             let handle: oce_infra::trivium::TriviumHandle = Arc::new(trivium_store);
             vector_engine = handle.clone();
             trivium = Some(handle);

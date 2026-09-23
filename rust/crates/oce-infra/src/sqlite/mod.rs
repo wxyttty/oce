@@ -2,6 +2,7 @@
 //! 个人模式单连接、WAL 并发读；schema 与 alembic head 一致。
 
 pub mod chains;
+pub mod fts_lexical;
 pub mod credentials;
 pub mod metrics;
 pub mod reports;
@@ -133,6 +134,15 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS ix_chunks_chunk_type ON chunks (chunk_type);
 CREATE INDEX IF NOT EXISTS ix_chunks_embedded ON chunks (embedded);
+
+-- FTS5 词法混合路（个人模式）：content 全文索引，bm25() 是真 BM25。
+-- hash/blob_name 作为返回列（UNINDEXED），scope 过滤在查询侧 WHERE 完成。
+-- 与 chunks 表通过 content_hash 关联；行生命周期跟随 blob_chunks（delete 时清理）。
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+    content,
+    content_hash UNINDEXED,
+    blob_name UNINDEXED
+);
 
 CREATE TABLE IF NOT EXISTS blob_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
