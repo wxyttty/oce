@@ -12,7 +12,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: rust/Dockerfile
+      dockerfile: Dockerfile
     ports:
       - "${OCE_PORT:-8986}:8986"
     env_file:
