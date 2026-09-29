@@ -333,6 +333,8 @@ impl WorkspaceIndexer {
             weak: audit.weak_match,
             degraded: audit.semantic_degraded,
             broad: audit.broad,
+            exact_skipped_scope: audit.exact_skipped_scope,
+            select_truncated: audit.select_truncated,
         };
         let formatted = if audit.related_symbols.is_empty() {
             format_retrieval_with_notes(&hits, &notes)

@@ -28,11 +28,17 @@ pub struct RetrievalNotes {
     /// broad regime（探索型查询宽窗口）：长摘录已骨架化，省略段以标记行
     /// 引用真实行号区间，agent 据此跟进读取全文
     pub broad: bool,
+    /// exact 标识符召回因 scope 超限被跳过：结果不含符号精确命中，
+    /// 「没查到」≠「没查」——agent 不应把缺席读成仓库里没有该符号
+    pub exact_skipped_scope: bool,
+    /// select 窗口被预算/单文件上限截短：池内还有候选但窗口未填满，
+    /// 展示的片段不是全部可用结果
+    pub select_truncated: bool,
 }
 
 impl RetrievalNotes {
     pub fn is_empty(&self) -> bool {
-        !self.weak && !self.degraded && !self.broad
+        !self.weak && !self.degraded && !self.broad && !self.exact_skipped_scope && !self.select_truncated
     }
 }
 
@@ -86,13 +92,27 @@ pub fn format_retrieval_full(
     }
 
     if sections.is_empty() && related.is_empty() {
-        return if notes.degraded {
-            format!(
-                "{HEADER}\nNote: the semantic index did not participate in this search (embedding backend unavailable); no keyword/structure match was found either. Retrying later may give better results."
-            )
-        } else {
-            HEADER.to_string()
-        };
+        // 空结果的原因必须可区分（Astrolabe Confidence::Unknown 原则）：
+        // degraded=语义路没跑；exact_skipped_scope=符号路没查；两者都不是
+        // 才是「查了，没有」。
+        let mut reason = String::new();
+        if notes.degraded {
+            reason.push_str(
+                "Note: the semantic index did not participate in this search (embedding backend unavailable); no keyword/structure match was found either. Retrying later may give better results.",
+            );
+        }
+        if notes.exact_skipped_scope {
+            if !reason.is_empty() {
+                reason.push('\n');
+            }
+            reason.push_str(
+                "Note: exact symbol lookup was skipped for this search (working set exceeds the configured scope limit) — the codebase may still define the symbols you named; try a narrower scope or search by identifier.",
+            );
+        }
+        if reason.is_empty() {
+            return HEADER.to_string();
+        }
+        return format!("{HEADER}\n{reason}");
     }
     let mut prefix = String::new();
     if notes.degraded {
@@ -103,7 +123,9 @@ pub fn format_retrieval_full(
         );
     }
     if notes.weak {
-        // 弱匹配被 padding 进窗口会被误读为「实现已找到」；提示真实代码可能在别的仓库/服务里
+        // 弱匹配被 padding 进窗口会被误读为「实现已找到」；提示真实代码可能在别的仓库/服务里。
+        // 触发条件含查询覆盖缺席（OwnMem 实测：覆盖率区分对错 AUC 0.886 vs 置信分 0.667）——
+        // 查询点名的标识符在窗口里零命中时同样视为弱
         prefix.push_str(
             "Note: no strongly matching code was found for this query. The fragments below are weak matches — the functionality you are looking for may not be implemented in this codebase (it could live in a separate repository or service).\n",
         );
@@ -112,6 +134,20 @@ pub fn format_retrieval_full(
         // broad 模式用覆盖换深度：不做此提示，被省略的骨架会被误读为「展示的行就是全部」
         prefix.push_str(
             "Note: exploratory query — the excerpts below are trimmed candidates from across the codebase. Long sections are elided; read the cited file paths and line ranges for full detail.\n",
+        );
+    }
+    if notes.exact_skipped_scope {
+        // scope 超限跳过 exact 召回：符号精确命中缺席是「没查」而非「没有」。
+        // agent 若把缺席读成仓库里没有该符号，会直接放弃搜索或改走全库 grep
+        prefix.push_str(
+            "Note: exact symbol lookup was skipped for this search (working set exceeds the configured scope limit) — the codebase may still define the symbols you named; try a narrower scope or search by identifier.\n",
+        );
+    }
+    if notes.select_truncated {
+        // 窗口被预算/单文件上限截短：展示的不是全部候选，agent 可据此
+        // 收窄查询或请求更多，而不是把当前窗口当成完整答案集
+        prefix.push_str(
+            "Note: the result window was trimmed by the context budget or per-file caps — more matching fragments exist beyond the excerpts shown.\n",
         );
     }
     let mut out = if sections.is_empty() {
@@ -192,6 +228,8 @@ mod tests {
                 weak: true,
                 degraded: false,
                 broad: false,
+                exact_skipped_scope: false,
+                select_truncated: false,
             },
         );
         assert!(out.contains("weak matches"));
@@ -218,6 +256,8 @@ mod tests {
                 weak: false,
                 degraded: true,
                 broad: false,
+                exact_skipped_scope: false,
+                select_truncated: false,
             },
         );
         assert!(out.contains("semantic index did not participate"));
@@ -232,6 +272,8 @@ mod tests {
                 weak: false,
                 degraded: true,
                 broad: false,
+                exact_skipped_scope: false,
+                select_truncated: false,
             },
         );
         assert!(out.starts_with(HEADER));
@@ -296,6 +338,8 @@ mod tests {
                 weak: false,
                 degraded: false,
                 broad: true,
+                exact_skipped_scope: false,
+                select_truncated: false,
             },
         );
         assert!(out.contains("exploratory query"));

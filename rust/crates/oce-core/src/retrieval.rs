@@ -89,6 +89,50 @@ pub(crate) fn line_set_public(content: &str) -> HashSet<String> {
     line_set(content)
 }
 
+/// 查询覆盖检测（OwnMem query-coverage 借鉴）：查询可提取的代码标识符在
+/// 选中窗口内容里是否全部缺席。全部缺席 = 查询点名的东西不在这批代码里
+/// ——这是「结果没解释问题」的信号，与分数阈值互补（分数答「多自信」，
+/// 覆盖答「解释了没有」）。无标识符查询（纯自然语言）不参与，返回 false。
+fn query_identifiers_absent(query: &str, hits: &[SearchHit]) -> bool {
+    let identifiers = extract_code_identifiers(query);
+    if identifiers.is_empty() || hits.is_empty() {
+        return false;
+    }
+    // 标识符按词边界匹配（避免 add_provider 误命中 add_provider_v2 的
+    // 子串假阳性）；命中任一标识符即视为覆盖
+    for ident in &identifiers {
+        let needle = ident.as_str();
+        for hit in hits {
+            if contains_word(&hit.content, needle) || contains_word(&hit.path, needle) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 词边界子串匹配：needle 两侧不是 [A-Za-z0-9_$] 才算命中。
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let before_ok = haystack[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '$');
+        let after = &haystack[abs + needle.len()..];
+        let after_ok = after
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '$');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + needle.len().max(1);
+    }
+    false
+}
+
 pub(crate) fn line_jaccard_public(content: &str, seated: &HashSet<String>) -> f32 {
     // 与 line_jaccard 同式，但候选侧惰性建集（省一次分配）
     if seated.is_empty() {
@@ -423,13 +467,17 @@ impl RetrievalPipeline {
         if let Some(a) = audit.as_deref_mut() {
             a.semantic_degraded = self.cooldowns.embed.is_down();
         }
-        // 弱匹配判定（借鉴 BCE rerankWeakTop）：头部命中分低于阈值即视为弱。
-        // 阈值取 0.30 —— 融合分是归一化 RRF（≤1），exact 召回按 kind 打 0.85-1.0；
-        // 0.30 以下的头部意味着既无 exact 命中、语义/词法头部也弱，本仓库大概率没有答案。
+        // 弱匹配判定（借鉴 BCE rerankWeakTop + OwnMem query-coverage 洞察）：
+        // 头部命中分低于阈值 OR 查询点名的标识符在窗口内容里零命中。
+        // OwnMem 实测（336 次已知对错交付）：置信分区分对错 AUC 0.812、剔除
+        // 自证样本后 0.667，而查询覆盖率 0.886——「ranker 多自信」与「结果
+        // 解释了问题没有」是两个问题，后者才是无答案检测的正确信号。
+        // 标识符零命中 = 查询点名的东西不在这批代码里（可能真的没有）。
         const WEAK_MATCH_HEAD: f32 = 0.30;
         let finish = |hits: Vec<SearchHit>, audit: Option<&mut RetrievalAudit>| {
             if let Some(a) = audit {
-                a.weak_match = hits.first().is_none_or(|h| h.score < WEAK_MATCH_HEAD);
+                a.weak_match = hits.first().is_none_or(|h| h.score < WEAK_MATCH_HEAD)
+                    || query_identifiers_absent(query, &hits);
             }
             hits
         };
@@ -857,12 +905,13 @@ impl RetrievalPipeline {
         mut audit: Option<&mut RetrievalAudit>,
     ) -> Vec<SearchHit> {
         tracing::info!("Path-boosted search for query: {query}");
-        // 弱匹配判定与主路径同一阈值；路径查询的头部分含 path boost，
-        // 纯文件名命中（回填 0.9）不会误判为弱
+        // 弱匹配判定与主路径同一规则（分数阈值 + 标识符覆盖）；路径查询的
+        // 头部分含 path boost，纯文件名命中（回填 0.9）不会误判为弱
         const WEAK_MATCH_HEAD: f32 = 0.30;
         let finish = |hits: Vec<SearchHit>, audit: Option<&mut RetrievalAudit>| {
             if let Some(a) = audit {
-                a.weak_match = hits.first().is_none_or(|h| h.score < WEAK_MATCH_HEAD);
+                a.weak_match = hits.first().is_none_or(|h| h.score < WEAK_MATCH_HEAD)
+                    || query_identifiers_absent(query, &hits);
             }
             hits
         };
@@ -1136,6 +1185,47 @@ mod tests {
             start_line: 1,
             end_line: 1,
         }
+    }
+
+    fn hit_with_content(path: &str, content: &str) -> SearchHit {
+        SearchHit {
+            blob_name: format!("b-{path}"),
+            path: path.into(),
+            content: content.into(),
+            score: 0.5,
+            content_hash: String::new(),
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    #[test]
+    fn query_identifiers_absent_detects_uncovered_window() {
+        // 查询点名 add_provider，窗口内容/路径都不含该词 → 覆盖缺席
+        let hits = vec![hit_with_content("a.rs", "fn other_thing() {}")];
+        assert!(query_identifiers_absent("`add_provider` 在哪里", &hits));
+        // 内容命中（词边界）→ 覆盖
+        let hits = vec![hit_with_content("a.rs", "invoke(\"add_provider\")")];
+        assert!(!query_identifiers_absent("`add_provider` 在哪里", &hits));
+        // 路径命中 → 覆盖
+        let hits = vec![hit_with_content("src/api/providers.ts", "export const x = 1;")];
+        assert!(!query_identifiers_absent("`providers` 在哪里", &hits));
+        // 子串不算命中：add_provider_v2 含 add_provider 子串但词边界不成立
+        let hits = vec![hit_with_content("a.rs", "fn add_provider_v2() {}")];
+        assert!(query_identifiers_absent("`add_provider` 在哪里", &hits));
+        // 无标识符查询（纯自然语言）不参与
+        assert!(!query_identifiers_absent("部署流程是什么", &hits));
+    }
+
+    #[test]
+    fn contains_word_respects_boundaries() {
+        assert!(contains_word("fn alpha_beta()", "alpha_beta"));
+        assert!(contains_word("x.alpha_beta", "alpha_beta"));
+        assert!(!contains_word("alpha_beta_v2", "alpha_beta"));
+        assert!(!contains_word("alpha_beta_x", "alpha_beta"));
+        assert!(contains_word("(alpha_beta)", "alpha_beta"));
+        assert!(contains_word("alpha_beta", "alpha_beta"));
+        assert!(!contains_word("beta", "alpha_beta"));
     }
 
     #[test]

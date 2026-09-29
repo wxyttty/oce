@@ -263,9 +263,19 @@ pub struct RetrievalAudit {
     /// 语义通路缺席（嵌入冷却/故障）：formatter 据此注入 degraded 提示
     pub semantic_degraded: bool,
     /// 最终命中头部分数低于阈值：formatter 据此注入 weak 提示
+    /// 最终命中头部分数低于阈值，或查询点名的标识符在窗口内容里零命中
+    /// （OwnMem query-coverage 借鉴：覆盖率区分对错 AUC 0.886 vs 置信分 0.667）：
+    /// formatter 据此注入 weak 提示
     pub weak_match: bool,
     /// broad regime 已生效（formatter 据此注入骨架化提示）
     pub broad: bool,
+    /// exact 标识符召回因 scope 超限整体跳过（查询含标识符、store 在场、
+    /// 却被 exact_max_scope_blobs 拦下）：「没查到符号」与「没查符号」
+    /// 对外观相同，formatter 据此注入提示（Astrolabe unknown-vs-empty 原则）
+    pub exact_skipped_scope: bool,
+    /// select 窗口被预算/单文件上限截短（池内还有候选但窗口未填满）：
+    /// 「只有这些」与「还有更多被省略」是不同信号，formatter 据此注入提示
+    pub select_truncated: bool,
     /// related symbols hints（输出层追加；空 = 未开启或无可用定义）
     pub related_symbols: Vec<crate::related::RelatedSymbol>,
 }

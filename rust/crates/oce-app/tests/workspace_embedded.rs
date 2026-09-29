@@ -338,12 +338,14 @@ fn settings_for_with_broad(ws: &std::path::Path) -> Settings {
     s
 }
 
-/// 构造 broad fixture：28 个与查询共享词法信号的代码文件 + 1 个与查询
+/// 构造 broad fixture：18 个与查询共享词法信号的代码文件 + 1 个与查询
 /// 零词法重叠的清单文件（manifest prior 的提升对象）+ 1 个 60 行长文件
-/// （骨架化对象）。共 30 个 blob，focused 10 座席装不下、broad 20 座席。
+/// （骨架化对象）。共 20 个 blob，focused 10 座席装不下、broad 20 座席
+/// 恰好全量入窗——长文件不依赖 dense 排名挤进窗口（FakeEmbedder 4-gram
+/// 哈希下 60 行混填料的向量被 3 行纯词法文件稀释，排名不可靠）。
 fn write_broad_fixture(ws: &std::path::Path) {
     std::fs::create_dir_all(ws.join("src")).unwrap();
-    for i in 0..28 {
+    for i in 0..18 {
         std::fs::write(
             ws.join(format!("src/feature_{i:02}_service.rs")),
             format!(
