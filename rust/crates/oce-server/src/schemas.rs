@@ -73,12 +73,42 @@ pub struct CodebaseRetrievalRequest {
     pub blobs: BlobsPayload,
     #[serde(default)]
     pub chat_history: Vec<serde_json::Value>,
+    /// 范围内还有 pending blob 时最多等待多少毫秒（0 = 不等，默认）。
+    /// 上限 120000：等待发生在请求路径上，不能让调用方无限占着连接。
+    #[serde(default)]
+    pub freshness_wait_ms: Option<u64>,
+}
+
+/// 本次检索范围的索引就绪度（REQ-8：pending 不得被当成"查不到"）。
+#[derive(Debug, Serialize)]
+pub struct IndexReadinessPayload {
+    pub mode: String,
+    pub scope_size: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub ready: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_type: Option<String>,
+}
+
+impl From<oce_core::search::IndexReadiness> for IndexReadinessPayload {
+    fn from(value: oce_core::search::IndexReadiness) -> Self {
+        Self {
+            mode: value.mode().to_string(),
+            scope_size: value.scope_size,
+            pending: value.pending,
+            failed: value.failed,
+            ready: value.ready,
+            last_error_type: value.last_error_type,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct CodebaseRetrievalResponse {
     pub formatted_retrieval: String,
     pub codebase_retrieval_elapsed_ms: i64,
+    pub index: IndexReadinessPayload,
 }
 
 #[derive(Debug, Deserialize)]

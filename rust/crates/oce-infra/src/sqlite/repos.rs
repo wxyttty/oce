@@ -554,6 +554,52 @@ impl BlobRepository for SqlBlobRepository {
         result.map_err(|m| OceError::new(m, "SqliteError"))
     }
 
+    /// 就绪度上报用：一次 `IN` 查询取 status + error_message，不加载 chunk。
+    async fn status_summary(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<oce_core::indexing::BlobStatusSummary> {
+        let mut names: Vec<String> = blob_names.to_vec();
+        names.sort();
+        names.dedup();
+        names.retain(|name| !name.is_empty());
+        if names.is_empty() {
+            return Ok(oce_core::indexing::BlobStatusSummary::default());
+        }
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT status, error_message FROM blobs WHERE blob_name IN ({})",
+                    vec!["?"; names.len()].join(", ")
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(names.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut out = oce_core::indexing::BlobStatusSummary::default();
+                for row in rows.flatten() {
+                    match row.0.as_str() {
+                        "ready" => out.ready += 1,
+                        "error" => {
+                            out.failed += 1;
+                            if out.last_error_type.is_none() {
+                                out.last_error_type = row.1.filter(|m| !m.is_empty());
+                            }
+                        }
+                        _ => out.pending += 1,
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
+
     async fn get_many(&self, blob_names: &[String]) -> OceResult<HashMap<String, Blob>> {
         let db = self.db.clone();
         let names: Vec<String> = blob_names.to_vec();

@@ -31,6 +31,19 @@ pub struct DomainEvent {
     pub data: serde_json::Value,
 }
 
+/// scope 内 blob 的状态汇总（就绪度上报用）。
+///
+/// 只统计**库里存在**的行；范围内但库里没有的条数由调用方按
+/// `scope_size - ready - pending - failed` 推出，算作 pending（还没上传完）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlobStatusSummary {
+    pub ready: usize,
+    pub pending: usize,
+    pub failed: usize,
+    /// 首个非空错误原因（`failed > 0` 时才有意义）。
+    pub last_error_type: Option<String>,
+}
+
 /// Blob/Chunk 元数据的仓储端口（infrastructure 实现；对应 Python repositories）。
 #[async_trait]
 pub trait BlobRepository: Send + Sync {
@@ -42,6 +55,9 @@ pub trait BlobRepository: Send + Sync {
     async fn delete_staging(&self, blob_name: &str) -> OceResult<()>;
     /// 取 pending 状态的 blob（限定 blob_names 时只取其中 pending 的）。
     async fn find_pending(&self, blob_names: Option<&[String]>) -> OceResult<Vec<Blob>>;
+    /// scope 内 blob 的状态汇总（检索就绪度上报用）。
+    /// 必须是**一次查询**、不加载 chunk——它在每次检索的入口上跑。
+    async fn status_summary(&self, blob_names: &[String]) -> OceResult<BlobStatusSummary>;
     /// 按 last_seen 找过期 blob（GC 用）。
     async fn find_expired(&self, ttl_days: u32, batch_size: usize) -> OceResult<Vec<String>>;
     /// 批量存在性检查。
@@ -237,21 +253,42 @@ impl IndexingPipeline {
                 }
             }
         }
-        let chunked: Vec<(&Blob, Vec<Chunk>)> = to_chunk
+        let chunked: Vec<(&Blob, Vec<Chunk>, Option<String>)> = to_chunk
             .par_iter()
-            .map(|(blob, content)| (*blob, self.chunker.chunk(content, &blob.path)))
+            .map(|(blob, content)| {
+                let chunks = self.chunker.chunk(content, &blob.path);
+                // 静默丢代码（正文与 span 不符 / 实质重叠 / 非空行没人覆盖）
+                // 必须变成可见的索引失败，而不是少索引一段实现。
+                // 1 行边界共享（cAST 实测形态）只告警：它不丢代码，把整个文件判 error 更糟。
+                let inspection = crate::chunk::validate::inspect_chunks(content, &chunks);
+                if !inspection.boundary_overlaps.is_empty() {
+                    tracing::warn!(
+                        "chunk boundary overlap in {}: lines {:?} indexed twice",
+                        blob.path,
+                        inspection.boundary_overlaps
+                    );
+                }
+                let invalid = inspection.hard.first().cloned();
+                (*blob, chunks, invalid)
+            })
             .collect();
         // 空切块与有切块分开处理：有切块的走一次批量事务写回
         let mut write_back: Vec<(String, Vec<Chunk>)> = Vec::new();
-        for (blob, chunks) in &chunked {
-            if !chunks.is_empty() {
+        for (blob, chunks, invalid) in &chunked {
+            if invalid.is_none() && !chunks.is_empty() {
                 write_back.push((blob.blob_name.clone(), chunks.clone()));
             }
         }
         if !write_back.is_empty() {
             self.blob_repo.save_chunks_many(&write_back).await?;
         }
-        for (blob, chunks) in &chunked {
+        for (blob, chunks, invalid) in &chunked {
+            if let Some(reason) = invalid {
+                let mut b = (*blob).clone();
+                b.mark_error(&format!("chunk validation: {reason}"));
+                self.blob_repo.save(&b).await?;
+                continue;
+            }
             if chunks.is_empty() {
                 let mut b = (*blob).clone();
                 b.mark_ready();

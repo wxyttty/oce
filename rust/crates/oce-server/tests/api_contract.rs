@@ -416,3 +416,96 @@ async fn admin_endpoints_auth_and_crud() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// STEP-13：范围全部就绪时 `index.mode == "ready"`、`pending == 0`，且立即返回。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrieval_reports_all_ready_scope() {
+    let router = app("ready").await;
+    let key = "sk-opencontextengine";
+
+    let (_, body) = call(
+        router.clone(),
+        "POST",
+        "/batch-upload",
+        Some(key),
+        Some(json!({"blobs": [{"path": "src/lib.rs", "content": CONTENT}], "checkpoint_id": ""})),
+    )
+    .await;
+    let blob_name = body["blob_names"][0].as_str().unwrap().to_string();
+    let (_, body) = call(
+        router.clone(),
+        "POST",
+        "/checkpoint-blobs",
+        Some(key),
+        Some(json!({"blobs": {"added_blobs": [blob_name]}})),
+    )
+    .await;
+    let checkpoint_id = body["new_checkpoint_id"].as_str().unwrap().to_string();
+
+    let (status, body) = call(
+        router,
+        "POST",
+        "/agents/codebase-retrieval",
+        Some(key),
+        Some(json!({
+            "information_request": "parse_config 定义",
+            "blobs": {"checkpoint_id": checkpoint_id},
+            "freshness_wait_ms": 0,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["index"]["mode"], "ready", "body={body}");
+    assert_eq!(body["index"]["pending"], 0);
+    assert_eq!(body["index"]["failed"], 0);
+    assert_eq!(body["index"]["scope_size"], 1);
+}
+
+/// STEP-13：范围里有 pending blob 时（等待 0ms）如实报告 `pending >= 1` 且仍返回结果。
+///
+/// 用「在 scope 里但服务端没有记录」的 blob 名来构造确定的 pending 态：
+/// `resolve_scope` 会对 added 里的名字尝试补嵌，没有 staging 内容就仍是 pending，
+/// 正是 REQ-8 要防的"把没就绪当成查不到"。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrieval_reports_pending_without_waiting() {
+    let router = app("pending").await;
+    let key = "sk-opencontextengine";
+
+    // 先放一个真正就绪的 blob，确保范围里既有 ready 也有 pending
+    let (_, body) = call(
+        router.clone(),
+        "POST",
+        "/batch-upload",
+        Some(key),
+        Some(json!({"blobs": [{"path": "src/lib.rs", "content": CONTENT}], "checkpoint_id": ""})),
+    )
+    .await;
+    let ready_blob = body["blob_names"][0].as_str().unwrap().to_string();
+    let never_uploaded = "a".repeat(64);
+
+    let (status, body) = call(
+        router,
+        "POST",
+        "/agents/codebase-retrieval",
+        Some(key),
+        Some(json!({
+            "information_request": "parse_config 定义",
+            "blobs": {"added_blobs": [ready_blob, never_uploaded]},
+            "freshness_wait_ms": 0,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["index"]["scope_size"], 2);
+    assert!(
+        body["index"]["pending"].as_u64().unwrap() >= 1,
+        "未就绪的 blob 必须如实上报为 pending: {body}"
+    );
+    assert_eq!(body["index"]["mode"], "pending");
+    assert!(
+        body["index"]["ready"].as_u64().unwrap() >= 1,
+        "已就绪的 blob 应计入 ready: {body}"
+    );
+    // 仍然返回结果，而不是报错或空响应
+    assert!(body["formatted_retrieval"].is_string());
+}

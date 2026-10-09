@@ -277,19 +277,23 @@ async fn codebase_retrieval(
 ) -> ApiResult<CodebaseRetrievalResponse> {
     verify_api_key(&headers, &state)?;
     let payload = req.blobs;
+    // 等待上限 120s：请求路径上的等待不能让调用方无限占用连接
+    let freshness_wait_ms = req.freshness_wait_ms.unwrap_or(0).min(120_000);
     let result = state
         .application
-        .retrieve(
+        .retrieve_with_freshness(
             &req.information_request,
             Some(payload.checkpoint_id.as_str()).filter(|s| !s.is_empty()),
             &payload.added_blobs,
             &payload.deleted_blobs,
+            freshness_wait_ms,
         )
         .await
         .map_err(|e| error_response(&e))?;
     Ok(Json(CodebaseRetrievalResponse {
         formatted_retrieval: result.formatted_retrieval,
         codebase_retrieval_elapsed_ms: result.elapsed_ms,
+        index: result.index.into(),
     }))
 }
 

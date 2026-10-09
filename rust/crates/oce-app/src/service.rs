@@ -40,6 +40,8 @@ pub struct RetrievalResult {
     pub hits: Vec<SearchHit>,
     pub formatted_retrieval: String,
     pub elapsed_ms: i64,
+    /// 本次范围的就绪度：pending 不得被当成"查不到"（REQ-8）。
+    pub index: oce_core::search::IndexReadiness,
 }
 
 #[derive(Debug, Default)]
@@ -159,10 +161,39 @@ impl RetrievalApplication {
         added_blobs: &[String],
         deleted_blobs: &[String],
     ) -> OceResult<RetrievalResult> {
+        self.retrieve_with_freshness(
+            information_request,
+            checkpoint_id,
+            added_blobs,
+            deleted_blobs,
+            0,
+        )
+        .await
+    }
+
+    /// 检索 + 新鲜度等待：`pending > 0` 且 `freshness_wait_ms > 0` 时按 200ms 轮询
+    /// 直到范围内没有 pending 或超时。超时仍返回结果，但 `index` 如实报告还有多少
+    /// 没就绪——绝不把 pending 的缺失当正常空结果。
+    pub async fn retrieve_with_freshness(
+        &self,
+        information_request: &str,
+        checkpoint_id: Option<&str>,
+        added_blobs: &[String],
+        deleted_blobs: &[String],
+        freshness_wait_ms: u64,
+    ) -> OceResult<RetrievalResult> {
         let started = Instant::now();
         let scope = self
             .resolve_scope(checkpoint_id, added_blobs, deleted_blobs)
             .await?;
+        let mut index = self.scope_readiness(&scope).await?;
+        if index.pending > 0 && freshness_wait_ms > 0 {
+            let deadline = Instant::now() + std::time::Duration::from_millis(freshness_wait_ms);
+            while index.pending > 0 && Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                index = self.scope_readiness(&scope).await?;
+            }
+        }
         let mut audit = RetrievalAudit::default();
         let hits = self
             .retrieval
@@ -199,7 +230,34 @@ impl RetrievalApplication {
             hits,
             formatted_retrieval: formatted,
             elapsed_ms,
+            index,
         })
+    }
+
+    /// 统计 scope 内 blob 的就绪度（一次聚合查询，不加载 chunk）。
+    ///
+    /// 范围内但库里没有记录的条数算作 pending：它还没走完上传/入队，同样不可检索。
+    async fn scope_readiness(
+        &self,
+        scope: &[String],
+    ) -> OceResult<oce_core::search::IndexReadiness> {
+        let mut readiness = oce_core::search::IndexReadiness {
+            scope_size: scope.len(),
+            ..Default::default()
+        };
+        if scope.is_empty() {
+            return Ok(readiness);
+        }
+        let summary = self.blob_repo.status_summary(scope).await?;
+        readiness.ready = summary.ready;
+        readiness.pending = summary.pending;
+        readiness.failed = summary.failed;
+        readiness.last_error_type = summary.last_error_type;
+        let accounted = summary.ready + summary.pending + summary.failed;
+        if accounted < scope.len() {
+            readiness.pending += scope.len() - accounted;
+        }
+        Ok(readiness)
     }
 
     /// scope 解析：(checkpoint 成员 ∪ added) − deleted。

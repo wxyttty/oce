@@ -69,6 +69,91 @@ pub trait ExactSearchStore: Send + Sync {
         let _ = (identifiers, allowed_blob_names);
         Ok(vec![])
     }
+
+    /// 按 blob 批量取 definition 行（符号注解用；一次查询覆盖整批命中，
+    /// 不逐命中查库）。默认空实现（端口可选）。
+    async fn definitions_for_blobs(&self, blob_names: &[String]) -> OceResult<Vec<SymbolRow>> {
+        let _ = blob_names;
+        Ok(vec![])
+    }
+}
+
+/// 本次检索范围内的索引就绪度。
+///
+/// 「绝不把 pending 的缺失当正常空结果」：调用方据此判断这次结果是否完整，
+/// 而不是把还没嵌入完的 blob 当成"查不到"。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexReadiness {
+    pub scope_size: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub ready: usize,
+    pub last_error_type: Option<String>,
+}
+
+impl IndexReadiness {
+    /// `ready` | `pending` | `degraded`。
+    ///
+    /// 有 pending 就是 `pending`（还在等，结果可能不完整）；没有 pending 但有失败
+    /// 就是 `degraded`（结果确定不完整，且不会自己变好）。
+    pub fn mode(&self) -> &'static str {
+        if self.pending > 0 {
+            "pending"
+        } else if self.failed > 0 {
+            "degraded"
+        } else {
+            "ready"
+        }
+    }
+}
+
+/// `symbol_occurrences` 里的一行 definition，用于把命中标注到符号名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRow {
+    pub identifier: String,
+    pub content_hash: String,
+    pub kind: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// 把命中标注到符号名：`search_hit_key` → `(符号名, kind)`。
+///
+/// 匹配规则：按 `content_hash` 对齐（空的 content_hash 不参与），且 occurrence 的
+/// `start_line` 落在命中 span 内；同 chunk 有多个 definition 时取 `start_line`
+/// 最小者——最靠近 chunk 起点的那个才是这段代码的定义点。取不到就不标注，
+/// 调用方按「无符号」处理，不做猜测。
+pub fn annotate_symbols(
+    hits: &[SearchHit],
+    rows: &[SymbolRow],
+) -> std::collections::HashMap<(String, String, u32, u32, String), (String, String)> {
+    use std::collections::HashMap;
+    let mut by_hash: HashMap<&str, Vec<&SymbolRow>> = HashMap::new();
+    for row in rows {
+        if !row.content_hash.is_empty() {
+            by_hash.entry(row.content_hash.as_str()).or_default().push(row);
+        }
+    }
+    let mut annotations: HashMap<(String, String, u32, u32, String), (String, String)> = HashMap::new();
+    for hit in hits {
+        if hit.content_hash.is_empty() {
+            continue;
+        }
+        let Some(candidates) = by_hash.get(hit.content_hash.as_str()) else {
+            continue;
+        };
+        let best = candidates
+            .iter()
+            .filter(|row| row.start_line >= hit.start_line && row.start_line <= hit.end_line)
+            .min_by_key(|row| row.start_line);
+        if let Some(row) = best {
+            annotations.insert(
+                search_hit_key(hit),
+                (row.identifier.clone(), row.kind.clone()),
+            );
+        }
+    }
+    annotations
 }
 
 /// 路径搜索结果（文件名查询专用索引）。
@@ -231,13 +316,45 @@ impl Reranker for NoopReranker {
 }
 
 /// LLM 语义重排器协议（对应 Python `LLMReranker`）。
-/// 输入候选带正文与行号；返回重排后的 SearchHit 子集。
+/// 输入候选带正文与行号；返回重排后的候选与降级信息。
 #[async_trait]
 pub trait LlmReranker: Send + Sync {
     /// LLM 重排的最大候选数（merge_exact_hits 的锚点窗口用）。
     fn max_candidates(&self) -> usize;
 
-    async fn rerank(&self, query: &str, candidates: Vec<SearchHit>) -> OceResult<Vec<SearchHit>>;
+    async fn rerank(
+        &self,
+        query: &str,
+        candidates: Vec<SearchHit>,
+    ) -> OceResult<LlmRerankOutcome>;
+}
+
+/// LLM 重排结果：除排序后的候选外，显式带上"是否降级"与请求/返回条数。
+///
+/// LLM 只返回编号列表、不返回校准分，因此"少给了几条"与"调用失败"过去只能靠
+/// 日志察觉。这里把两者变成可断言的数据，调用方写进 `RetrievalAudit`。
+#[derive(Debug, Clone)]
+pub struct LlmRerankOutcome {
+    /// 重排后的候选（不足时已按原序补齐，保证下游拿到足够的候选）。
+    pub ranked: Vec<SearchHit>,
+    /// 降级原因：`no_valid_index`（无有效编号）/ `padded`（返回不足已补齐）/
+    /// `chat_error`（调用失败，由调用方按错误码填入）。
+    pub degraded: Option<String>,
+    pub requested: usize,
+    pub returned: usize,
+}
+
+/// LLM 重排降级分类：0 条有效编号 = `no_valid_index`；少于要求 = `padded`。
+///
+/// 独立成纯函数，便于在 core 层直接断言（不需要起 HTTP 端点）。
+pub fn classify_llm_rerank_degraded(requested: usize, returned: usize) -> Option<String> {
+    if returned == 0 {
+        Some("no_valid_index".to_string())
+    } else if returned < requested {
+        Some("padded".to_string())
+    } else {
+        None
+    }
 }
 
 /// 查询改写器协议（对应 Python `QueryRewriter`）。
@@ -278,6 +395,12 @@ pub struct RetrievalAudit {
     pub select_truncated: bool,
     /// related symbols hints（输出层追加；空 = 未开启或无可用定义）
     pub related_symbols: Vec<crate::related::RelatedSymbol>,
+    /// API rerank 通路降级原因（熔断/畸形响应）：空 = 未降级
+    pub rerank_degraded: Option<String>,
+    /// LLM rerank 通路降级原因（`no_valid_index` / `padded` / `chat_error`）
+    pub llm_rerank_degraded: Option<String>,
+    /// LLM rerank 实际返回的候选条数（含补齐后），用于判断"少给了几条"
+    pub llm_rerank_returned: Option<usize>,
 }
 
 impl RetrievalAudit {
@@ -301,5 +424,67 @@ impl Drop for AuditGuard<'_> {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed().as_millis() as u64;
         *self.audit.stages.entry(self.name.clone()).or_insert(0) += elapsed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(path: &str, hash: &str, start: u32, end: u32) -> SearchHit {
+        SearchHit {
+            blob_name: format!("b-{path}"),
+            path: path.into(),
+            content: "x".into(),
+            score: 0.5,
+            content_hash: hash.into(),
+            start_line: start,
+            end_line: end,
+        }
+    }
+
+    fn row(identifier: &str, hash: &str, start: u32) -> SymbolRow {
+        SymbolRow {
+            identifier: identifier.into(),
+            content_hash: hash.into(),
+            kind: "definition".into(),
+            start_line: start,
+            end_line: start,
+        }
+    }
+
+    #[test]
+    fn annotate_symbols_matches_by_hash_and_span() {
+        let hits = vec![
+            hit("a.rs", "h-a", 10, 40),
+            hit("b.rs", "h-b", 1, 5),
+            hit("c.rs", "", 1, 5), // 无 content_hash：不参与标注
+        ];
+        let rows = vec![
+            row("alpha", "h-a", 10),   // 落在 a.rs 命中 span 内
+            row("beta", "h-a", 80),    // 同一 chunk 但在 span 外
+            row("gamma", "h-z", 1),    // 该 blob 没命中
+        ];
+        let annotations = annotate_symbols(&hits, &rows);
+        assert_eq!(annotations.len(), 1);
+        let key = search_hit_key(&hits[0]);
+        assert_eq!(
+            annotations.get(&key).map(|(symbol, kind)| (symbol.as_str(), kind.as_str())),
+            Some(("alpha", "definition"))
+        );
+        assert!(annotations.get(&search_hit_key(&hits[1])).is_none());
+        assert!(annotations.get(&search_hit_key(&hits[2])).is_none());
+    }
+
+    #[test]
+    fn annotate_symbols_prefers_earliest_definition_in_span() {
+        let hits = vec![hit("a.rs", "h-a", 10, 40)];
+        let rows = vec![row("later", "h-a", 30), row("earlier", "h-a", 12)];
+        let annotations = annotate_symbols(&hits, &rows);
+        let key = search_hit_key(&hits[0]);
+        assert_eq!(
+            annotations.get(&key).map(|(symbol, _)| symbol.as_str()),
+            Some("earlier")
+        );
     }
 }

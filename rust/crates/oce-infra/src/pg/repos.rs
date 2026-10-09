@@ -472,6 +472,41 @@ impl BlobRepository for PgBlobRepository {
             .collect())
     }
 
+    /// 就绪度上报用：一次 `ANY($1)` 查询取 status + error_message，不加载 chunk。
+    async fn status_summary(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<oce_core::indexing::BlobStatusSummary> {
+        let mut names: Vec<String> = blob_names.to_vec();
+        names.sort();
+        names.dedup();
+        names.retain(|name| !name.is_empty());
+        if names.is_empty() {
+            return Ok(oce_core::indexing::BlobStatusSummary::default());
+        }
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, error_message FROM blobs WHERE blob_name = ANY($1)",
+        )
+        .bind(names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        let mut out = oce_core::indexing::BlobStatusSummary::default();
+        for (status, error) in rows {
+            match status.as_str() {
+                "ready" => out.ready += 1,
+                "error" => {
+                    out.failed += 1;
+                    if out.last_error_type.is_none() {
+                        out.last_error_type = error.filter(|m| !m.is_empty());
+                    }
+                }
+                _ => out.pending += 1,
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_many(&self, blob_names: &[String]) -> OceResult<HashMap<String, Blob>> {
         if blob_names.is_empty() {
             return Ok(HashMap::new());

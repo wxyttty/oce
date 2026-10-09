@@ -143,3 +143,79 @@ async fn oversize_scope_returns_empty() {
         .unwrap();
     assert!(defs.is_empty());
 }
+
+/// 指定行跨度的 definition 行（符号注解测试用；既有 seed_symbol 固定 1..1）。
+fn seed_symbol_at(
+    conn: &rusqlite::Connection,
+    identifier: &str,
+    blob_name: &str,
+    content_hash: &str,
+    kind: &str,
+    start_line: i64,
+    end_line: i64,
+) {
+    conn.execute(
+        "INSERT INTO chunks (content_hash, content, content_size) VALUES (?1, 'x', 1)
+         ON CONFLICT DO NOTHING",
+        rusqlite::params![content_hash],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO blob_chunks (blob_name, content_hash, start_line, end_line, chunk_index)
+         VALUES (?1, ?2, 1, 1, 0)",
+        rusqlite::params![blob_name, content_hash],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO symbol_occurrences (identifier, blob_name, content_hash, kind, start_line, end_line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![identifier, blob_name, content_hash, kind, start_line, end_line],
+    )
+    .unwrap();
+}
+
+/// STEP-9 验收：按 blob 批量取 definition 行，并按 content_hash + span 标注到命中。
+#[tokio::test(flavor = "multi_thread")]
+async fn symbol_lookup_annotates_hits_by_span() {
+    let db = SqlDb::open_memory().unwrap();
+    db.with_conn(|conn| {
+        seed_blob(conn, "blob-a", "src/a.rs");
+        seed_symbol_at(conn, "alpha", "blob-a", "hash-a1", "definition", 10, 30);
+        seed_symbol_at(conn, "beta", "blob-a", "hash-a2", "definition", 40, 60);
+        // reference 行不参与标注（查询只取 definition）
+        seed_symbol_at(conn, "alpha_ref", "blob-a", "hash-a1", "reference", 12, 12);
+        Ok(())
+    })
+    .unwrap();
+
+    let rows = store(&db)
+        .definitions_for_blobs(&["blob-a".into(), "blob-a".into()])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "只返回 definition 行，且重复 blob 名已去重");
+
+    let hit = oce_core::search::SearchHit {
+        blob_name: "blob-a".into(),
+        path: "src/a.rs".into(),
+        content: "x".into(),
+        score: 0.5,
+        content_hash: "hash-a1".into(),
+        start_line: 8,
+        end_line: 20,
+    };
+    let annotations = oce_core::search::annotate_symbols(&[hit.clone()], &rows);
+    let annotation = annotations
+        .get(&oce_core::search::search_hit_key(&hit))
+        .expect("alpha 落在命中 span 内，应被标注");
+    assert_eq!(annotation.0, "alpha");
+    assert_eq!(annotation.1, "definition");
+
+    // span 外的 definition（beta 在 40..60）不标注
+    let outside = oce_core::search::SearchHit {
+        content_hash: "hash-a2".into(),
+        start_line: 70,
+        end_line: 90,
+        ..hit
+    };
+    assert!(oce_core::search::annotate_symbols(&[outside], &rows).is_empty());
+}
