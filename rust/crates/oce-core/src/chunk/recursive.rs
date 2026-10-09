@@ -11,7 +11,7 @@
 //! - 最终 chunk 由起始行 tile 成连续不重叠行区间，块间无重叠
 
 use super::lang::detect_language;
-use super::spans::{cap_span, char_len, trim_trailing_blank_lines};
+use super::spans::{cap_span, char_len, slice_lines, trim_trailing_blank_lines};
 use super::types::Chunk;
 use async_trait::async_trait;
 use regex::Regex;
@@ -322,14 +322,36 @@ impl RecursiveChunker {
     }
 
     fn emit(&self, spans: Vec<(u32, u32)>, lines: &[&str], path: &str) -> Vec<Chunk> {
-        let mut chunks = Vec::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
         for (start, end) in spans {
             let trimmed = trim_trailing_blank_lines(lines, start, end);
             for (span_start, span_end, text) in
                 cap_span(lines, start, trimmed, self.chunk_size.max(MAX_SPAN_CHARS))
             {
                 if !is_meaningful(&text) {
-                    continue;
+                    // 纯标点/空白片段（如孤立的 `}`、`*/`、`  ]`）不单独成块，
+                    // 但**必须并入前一块**：直接丢弃会让这些行谁都覆盖不到，
+                    // 破坏"坐标无损、不静默丢代码"的不变量（实测
+                    // codex_deepseek_catalog_template.json 尾部就丢过 3 行）。
+                    let cap = self.chunk_size.max(MAX_SPAN_CHARS);
+                    if let Some(last) = chunks.last_mut() {
+                        let merged_text = slice_lines(lines, last.start_line, span_end);
+                        if char_len(&merged_text) <= cap {
+                            if let Ok(chunk) = Chunk::new(
+                                Chunk::compute_hash(&merged_text),
+                                path,
+                                merged_text,
+                                last.start_line,
+                                span_end,
+                                last.chunk_type.clone(),
+                            ) {
+                                *last = chunk;
+                                continue;
+                            }
+                        }
+                    }
+                    // 并进前一块会超预算（或前面还没有块）→ 仍然成块：
+                    // 宁可有噪声块，也不能有覆盖不到的行。
                 }
                 if let Ok(chunk) = Chunk::new(
                     Chunk::compute_hash(&text),

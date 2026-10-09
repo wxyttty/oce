@@ -12,6 +12,7 @@ pub mod recursive;
 pub mod router;
 pub mod spans;
 pub mod types;
+pub mod validate;
 pub mod vue;
 
 pub use cast::CastChunker;
@@ -19,7 +20,7 @@ pub use jsp::JspChunker;
 pub use lang::{detect_language, supported_languages};
 pub use markdown::MarkdownChunker;
 pub use recursive::{is_meaningful, RecursiveChunker};
-pub use router::{build_chunker, LanguageChunkerRouter};
+pub use router::{build_chunker, chunker_fingerprint, LanguageChunkerRouter, CHUNKER_VERSION};
 pub use spans::char_len;
 pub use types::{Chunk, ChunkRef, LocatedChunk};
 pub use vue::VueChunker;

@@ -19,7 +19,7 @@ use super::Chunker;
 use async_trait::async_trait;
 use std::sync::OnceLock;
 
-pub const DEFAULT_MAX_CHUNK_CHARS: usize = 6_000;
+pub const DEFAULT_MAX_CHUNK_CHARS: usize = 2_200;
 pub const DEFAULT_MIN_CHUNK_CHARS: usize = 300;
 
 /// 低端非空白字符密度下限（Swift 0.67 最低）。用下限换算预算，
@@ -549,10 +549,22 @@ impl CastChunker {
         }
         let mut merged: Vec<(u32, u32, String)> = Vec::new();
         for (start, end, chunk_type) in ranges {
-            if let Some((prev_start, prev_end, _)) = merged.last().cloned() {
+            if let Some((prev_start, prev_end, prev_type)) = merged.last().cloned() {
                 if end <= prev_end {
                     continue;
                 }
+                if start <= prev_end {
+                    // 相邻块共享边界行（cAST 实测形态：前块 end == 后块 start，如
+                    // flask 的 [51..82] 与 [82..176]）。边界行归后一块——它是后一块的
+                    // 定义头，跟着定义体更合理；前一块收回一行，既不重叠也不漏行。
+                    if start - 1 >= prev_start {
+                        *merged.last_mut().unwrap() = (prev_start, start - 1, prev_type);
+                    } else {
+                        continue;
+                    }
+                }
+            }
+            if let Some((prev_start, prev_end, _)) = merged.last().cloned() {
                 if span_chars(lines, prev_start, prev_end) < self.min_chunk_chars {
                     *merged.last_mut().unwrap() = (prev_start, end, chunk_type);
                     continue;
