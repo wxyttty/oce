@@ -303,9 +303,10 @@ dense 做 RRF(k=60) 融合。gated 只喂代码标识符（对齐 trivium 门控
 
 ```bash
 # 编排启动（pgvector 镜像 + redis；无 etcd/minio/milvus）
-docker compose -f docker-compose.service.yml up -d
+# compose 文件在仓库根目录（与 Python 版共用部署入口）
+docker compose -f ../docker-compose.service.yml up -d
 
-# 或本机运行：依赖 docker-compose.dev.yml 的 postgres(25432)/redis(26379)
+# 或本机运行：依赖 docker-compose.service.yml 的 postgres(25432)/redis(26379)
 ./target/release/oce init --service --data-dir ~/.oce/data   # 生成服务模式 .env
 # 编辑 .env：DB_URL / REDIS_URL / EMBED_API_KEY / TRIVIUM_PATH
 ./target/release/oce serve --data-dir ~/.oce/data
