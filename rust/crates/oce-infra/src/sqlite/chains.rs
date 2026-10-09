@@ -423,6 +423,47 @@ impl ExactSearchStore for SqlExactStore {
         .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
         result.map_err(|m| OceError::new(m, "SqliteError"))
     }
+
+    /// 按 blob 批量取 definition 行（符号注解用；一次查询覆盖整批，不逐命中查库）。
+    async fn definitions_for_blobs(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<Vec<oce_core::search::SymbolRow>> {
+        let mut blob_names: Vec<String> = blob_names.to_vec();
+        blob_names.sort();
+        blob_names.dedup();
+        blob_names.retain(|name| !name.is_empty());
+        if blob_names.is_empty() {
+            return Ok(vec![]);
+        }
+        let db = self.db.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let sql = format!(
+                    "SELECT identifier, content_hash, kind, start_line, end_line
+                     FROM symbol_occurrences
+                     WHERE kind = 'definition' AND blob_name IN ({})",
+                    vec!["?"; blob_names.len()].join(", ")
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(blob_names.iter()), |row| {
+                        Ok(oce_core::search::SymbolRow {
+                            identifier: row.get(0)?,
+                            content_hash: row.get(1)?,
+                            kind: row.get(2)?,
+                            start_line: row.get::<_, i64>(3)?.max(0) as u32,
+                            end_line: row.get::<_, i64>(4)?.max(0) as u32,
+                        })
+                    })
+                    .map_err(|e| e.to_string())?;
+                Ok(rows.flatten().collect())
+            })
+        })
+        .await
+        .map_err(|e| OceError::new(e.to_string(), "JoinError"))?;
+        result.map_err(|m| OceError::new(m, "SqliteError"))
+    }
 }
 
 fn score_by_kind(kind: &str) -> f32 {

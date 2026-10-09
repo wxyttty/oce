@@ -335,6 +335,43 @@ impl oce_core::search::ExactSearchStore for PgExactStore {
             })
             .collect())
     }
+
+    /// 按 blob 批量取 definition 行（符号注解用；一次查询覆盖整批，不逐命中查库）。
+    async fn definitions_for_blobs(
+        &self,
+        blob_names: &[String],
+    ) -> OceResult<Vec<oce_core::search::SymbolRow>> {
+        let mut blob_names: Vec<String> = blob_names.to_vec();
+        blob_names.sort();
+        blob_names.dedup();
+        blob_names.retain(|name| !name.is_empty());
+        if blob_names.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows = sqlx::query_as::<_, (String, String, String, i32, i32)>(
+            "SELECT identifier, content_hash, kind, start_line, end_line
+             FROM symbol_occurrences
+             WHERE kind = 'definition' AND blob_name = ANY($1)",
+        )
+        .bind(blob_names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(pg_err)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(identifier, content_hash, kind, start_line, end_line)| {
+                    oce_core::search::SymbolRow {
+                        identifier,
+                        content_hash,
+                        kind,
+                        start_line: start_line.max(0) as u32,
+                        end_line: end_line.max(0) as u32,
+                    }
+                },
+            )
+            .collect())
+    }
 }
 
 /// 首个 chunk 查询（LLM 重排候选内容用）。
