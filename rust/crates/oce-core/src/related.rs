@@ -30,7 +30,44 @@ const FANOUT_MAX: usize = 15;
 /// hints 里直接可见，必须在 hints 侧过滤（不动索引语义——提取器还有别的
 /// 消费方，改提取器会触发全量重索引）。
 const STOPWORDS: &[&str] = &[
-    // 英文常见词（docstring/注释高频）
+    // 英文常见词（docstring/注释/`.rst` 散文高频）。实测 flask 的 hints 里
+    // `that` / `can` 这类词会以"定义"身份出现（docs/*.rst 的散文被宽松定义正则
+    // 命中），对探索没有信息量。只收代词/限定词/助动词这类几乎不可能是符号名的词。
+    "that",
+    "this",
+    "these",
+    "those",
+    "they",
+    "them",
+    "their",
+    "there",
+    "here",
+    "you",
+    "your",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "have",
+    "has",
+    "had",
+    "are",
+    "was",
+    "were",
+    "been",
+    "being",
+    "also",
+    "such",
+    "than",
+    "when",
+    "where",
+    "which",
+    "what",
+    "how",
+    "why",
+    "who",
+    "whom",
     "and",
     "or",
     "not",
@@ -179,6 +216,9 @@ pub struct RelatedSymbol {
     /// 'endpoint' | 'definition'（symbol_occurrences.kind）
     pub kind: String,
     pub path: String,
+    /// 关系标签（`"calls"` = 窗口内确有静态调用点；None = 仅标识符出现）。
+    /// 只在渲染时多一个属性，不影响评分（评测只解析 `Path: ` 行）。
+    pub relation: Option<String>,
 }
 
 /// 从源文本提取标识符形态的 token（BCE identTokens 移植）。
@@ -260,13 +300,33 @@ pub fn related_symbol_hints(
     }
 
     // 统计选中内容里各 token 的引用次数，按频次降序（BCE 同款排序：
-    // 频次高 = 上下文反复依赖，定义位置更有探索价值）
+    // 频次高 = 上下文反复依赖，定义位置更有探索价值）。
+    //
+    // 关系过滤：只在动态分派表达式里出现的 token 不算"被引用"
+    // （`handlers["refresh"](1)` 的 `refresh` 是字符串键，不是被调符号）；
+    // 静态调用点命中的 token 额外打上 `calls` 标签。
     let mut refs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut call_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for hit in selected {
-        for token in ident_tokens(&hit.content) {
-            if defs.contains_key(token.as_str()) {
-                *refs.entry(token).or_insert(0) += 1;
+        let dynamic_spans = crate::relation::unresolved_call_spans(&hit.content);
+        for relation in crate::relation::extract_relations(&hit.path, &hit.content) {
+            if relation.is_resolved() {
+                let last = relation
+                    .dst_identifier
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(relation.dst_identifier.as_str());
+                call_targets.insert(last.to_string());
             }
+        }
+        for token in ident_tokens(&hit.content) {
+            if !defs.contains_key(token.as_str()) {
+                continue;
+            }
+            if only_inside_dynamic_calls(&hit.content, &token, &dynamic_spans) {
+                continue;
+            }
+            *refs.entry(token).or_insert(0) += 1;
         }
     }
     let mut names: Vec<String> = refs.keys().cloned().collect();
@@ -283,9 +343,35 @@ pub fn related_symbol_hints(
                 name: def.identifier.clone(),
                 kind: def.kind.clone(),
                 path: def.path.clone(),
+                relation: call_targets
+                    .contains(name.as_str())
+                    .then(|| "calls".to_string()),
             }
         })
         .collect()
+}
+
+/// 该 token 在内容里的**每一次**出现是否都落在动态分派跨度内。
+/// 只要有一次出现在普通代码里，就算被正常引用。
+fn only_inside_dynamic_calls(content: &str, token: &str, spans: &[(usize, usize)]) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
+    let mut found_outside = false;
+    let mut start = 0usize;
+    while let Some(offset) = content[start..].find(token) {
+        let position = start + offset;
+        let end = position + token.len();
+        let inside = spans
+            .iter()
+            .any(|(span_start, span_end)| position >= *span_start && end <= *span_end);
+        if !inside {
+            found_outside = true;
+            break;
+        }
+        start = end;
+    }
+    !found_outside
 }
 
 #[cfg(test)]
@@ -421,5 +507,90 @@ mod tests {
         let hints = related_symbol_hints(&selected, &defs);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].name, "ConfigX");
+    }
+}
+
+#[cfg(test)]
+mod relation_hint_tests {
+    use super::*;
+    use crate::search::SearchHit;
+
+    fn hit(path: &str, content: &str) -> SearchHit {
+        SearchHit {
+            blob_name: format!("b-{path}"),
+            path: path.into(),
+            content: content.into(),
+            score: 0.5,
+            content_hash: String::new(),
+            start_line: 1,
+            end_line: 10,
+        }
+    }
+
+    fn def(identifier: &str, path: &str) -> SymbolDefinition {
+        SymbolDefinition {
+            identifier: identifier.into(),
+            kind: "definition".into(),
+            path: path.into(),
+            file_fanout: 1,
+        }
+    }
+
+    /// STEP-14：静态调用点命中的 hint 带 `calls` 标签。
+    #[test]
+    fn hints_label_resolved_calls() {
+        let selected = vec![hit("src/app.py", "def run(client):\n    client.refresh()\n")];
+        let definitions = vec![def("refresh", "src/client.py")];
+        let hints = related_symbol_hints(&selected, &definitions);
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert_eq!(hints[0].name, "refresh");
+        assert_eq!(hints[0].relation.as_deref(), Some("calls"));
+    }
+
+    /// STEP-14：只在动态分派表达式里出现的标识符不进 hints
+    /// （`handlers["refresh"](1)` 的 `refresh` 是字符串键，不是被调符号）。
+    #[test]
+    fn unresolved_relation_not_in_hints() {
+        let selected = vec![hit(
+            "src/app.py",
+            "def run(handlers):\n    handlers[\"refresh\"](1)\n",
+        )];
+        let definitions = vec![def("refresh", "src/client.py")];
+        let hints = related_symbol_hints(&selected, &definitions);
+        assert!(hints.is_empty(), "动态分派里的字符串键不该进 hints: {hints:?}");
+    }
+
+    /// 同一次出现既在动态调用里、又在普通代码里 → 仍算被引用。
+    #[test]
+    fn token_also_used_normally_still_hints() {
+        let selected = vec![hit(
+            "src/app.py",
+            "def run(handlers):\n    handlers[\"refresh\"](1)\n    refresh()\n",
+        )];
+        let definitions = vec![def("refresh", "src/client.py")];
+        let hints = related_symbol_hints(&selected, &definitions);
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert_eq!(hints[0].relation.as_deref(), Some("calls"));
+    }
+
+    /// STEP-14 关键不变量：hints 只追加文本，`Path:` 行集合逐字不变。
+    #[test]
+    fn hints_do_not_change_path_lines() {
+        let hits = vec![hit("src/app.py", "def run(client):\n    client.refresh()\n")];
+        let notes = crate::formatter::RetrievalNotes::default();
+        let plain = crate::formatter::format_retrieval_with_notes(&hits, &notes);
+        let definitions = vec![def("refresh", "src/client.py")];
+        let hints = related_symbol_hints(&hits, &definitions);
+        assert!(!hints.is_empty());
+        let with_hints = crate::formatter::format_retrieval_full(&hits, &notes, &hints);
+
+        let path_lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| line.starts_with("Path: "))
+                .map(|line| line.to_string())
+                .collect()
+        };
+        assert_eq!(path_lines(&plain), path_lines(&with_hints));
+        assert!(with_hints.contains("<related_symbols"));
     }
 }

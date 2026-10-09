@@ -26,6 +26,7 @@ pub mod planner;
 pub mod priority;
 pub mod queue;
 pub mod related;
+pub mod relation;
 pub mod reports;
 pub mod retrieval;
 pub mod retrieval_settings;
@@ -33,6 +34,7 @@ pub mod search;
 pub mod selector;
 pub mod source_filter;
 pub mod span_merge;
+pub mod span_window;
 pub mod strategy;
 pub mod symbol;
 

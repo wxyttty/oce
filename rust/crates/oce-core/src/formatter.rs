@@ -163,11 +163,17 @@ pub fn format_retrieval_full(
             "\n<related_symbols hint=\"referenced by the context above and defined in this codebase, but not shown; search for them to explore further\">\n",
         );
         for r in related {
+            // 关系标签是可选的：只在窗口内确有静态调用点时多一个属性
+            let relation = match &r.relation {
+                Some(relation) => format!(" relation=\"{}\"", escape_attr(relation)),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "  <symbol name=\"{}\" kind=\"{}\" path=\"{}\"/>\n",
+                "  <symbol name=\"{}\" kind=\"{}\" path=\"{}\"{}/>\n",
                 escape_attr(&r.name),
                 escape_attr(&r.kind),
-                escape_attr(&r.path)
+                escape_attr(&r.path),
+                relation
             ));
         }
         out.push_str("</related_symbols>");
@@ -295,6 +301,7 @@ mod tests {
             name: "TokenRefresher".into(),
             kind: "definition".into(),
             path: "src/token.rs".into(),
+            relation: None,
         }];
         let out = format_retrieval_full(&[hit.clone()], &RetrievalNotes::default(), &related);
         // sections 在前，hints 在后；Path: 行仍是唯一的路径信号源（评测兼容）
@@ -315,6 +322,7 @@ mod tests {
             name: "a<&>b".into(),
             kind: "definition".into(),
             path: "src/a&b.rs".into(),
+            relation: None,
         }];
         let out = format_retrieval_full(&[], &RetrievalNotes::default(), &related);
         assert!(out.contains("name=\"a&lt;&amp;&gt;b\""));
