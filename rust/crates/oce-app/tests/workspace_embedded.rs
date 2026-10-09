@@ -360,18 +360,18 @@ fn write_broad_fixture(ws: &std::path::Path) {
         "[project]\nname = \"demo\"\nrequires-python = \">=3.13\"\n\n[tool.ruff]\nline-length = 100\n",
     )
     .unwrap();
-    // 60 行长文件：头 12 行富集查询词（dense 排名高，且不占 term 预算），
-    // 13-44 行无查询词填充，第 45 行含查询词（骨架化 term 保留行，用于
-    // 验证省略段之后的行号重同步），46-60 行继续填充。
+    // 52 行长文件（v3 切块预算下保持单 chunk）：头 12 行富集查询词（dense
+    // 排名高，且不占 term 预算），13-41 行无查询词填充，第 42 行含查询词
+    // （骨架化 term 保留行，用于验证省略段之后的行号重同步），43-52 行继续填充。
     let mut big = String::new();
     for i in 1..=12 {
         big.push_str(&format!("// service architecture header section {i}\n"));
     }
-    for i in 13..=44 {
+    for i in 13..=41 {
         big.push_str(&format!("// filler {i}\n"));
     }
     big.push_str("pub const SERVICE_HUB: &str = \"hub\";\n");
-    for i in 46..=60 {
+    for i in 43..=52 {
         big.push_str(&format!("// filler {i}\n"));
     }
     std::fs::write(ws.join("src/big_service.rs"), big).unwrap();
@@ -418,22 +418,22 @@ async fn broad_mode_engages_with_wide_window_and_skeleton() {
         "manifest prior must seat pyproject.toml: {}",
         out.formatted
     );
-    // 骨架化：60 行长文件压缩，标记行引用真实行号区间
+    // 骨架化：52 行长文件压缩，标记行引用真实行号区间
     assert!(
         out.formatted
-            .contains("lines omitted, read src/big_service.rs:13-44"),
+            .contains("lines omitted, read src/big_service.rs:13-41"),
         "long excerpt must be skeletonized with true cited range: {}",
         out.formatted
     );
-    // 行号重同步：第 45 行（查询词命中行，紧随标记之后）必须编成 45 而非
+    // 行号重同步：第 42 行（查询词命中行，紧随标记之后）必须编成 42 而非
     // 骨架内的偏移序号
     assert!(
-        out.formatted.contains("    45\tpub const SERVICE_HUB"),
+        out.formatted.contains("    42\tpub const SERVICE_HUB"),
         "line number after elision marker must resync to true lineno: {}",
         out.formatted
     );
     // 标记行本身不带行号前缀（紧跟前一行换行后原样出现）
-    assert!(out.formatted.contains("\n... (32 lines omitted"),);
+    assert!(out.formatted.contains("\n... (29 lines omitted"),);
     let _ = std::fs::remove_dir_all(&ws);
 }
 
@@ -464,13 +464,15 @@ fn settings_for_with_span_merge(ws: &std::path::Path) -> Settings {
 /// 恰好切成两个相邻 chunk（两半都含查询词），另加陪衬文件保证窗口有其他候选。
 fn write_span_merge_fixture(ws: &std::path::Path) {
     std::fs::create_dir_all(ws.join("src")).unwrap();
+    // 40 行（v3 切块预算下恰好两个相邻 chunk），两半都含查询词，
+    // 另加陪衬文件保证窗口有其他候选。
     let mut service = String::new();
-    for i in 1..=38 {
+    for i in 1..=20 {
         service.push_str(&format!(
             "service alpha part one detail {i} of the module\n"
         ));
     }
-    for i in 39..=76 {
+    for i in 21..=40 {
         service.push_str(&format!(
             "service alpha part two detail {i} of the module\n"
         ));
@@ -515,6 +517,6 @@ async fn span_merge_joins_adjacent_fragments() {
     assert_eq!(sections, 1, "相邻 chunk 必须合并成单节：{}", out.formatted);
     // 合并段内容两半都在（chunk 重构自完整行文本）
     assert!(out.formatted.contains("part one detail 1"));
-    assert!(out.formatted.contains("part two detail 76"));
+    assert!(out.formatted.contains("part two detail 40"));
     let _ = std::fs::remove_dir_all(&ws);
 }

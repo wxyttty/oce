@@ -208,6 +208,9 @@ pub struct RerankSettings {
     pub min_score: f32,
     /// 单次 rerank 请求文档数上限：超过则分批串行，全局重排后截断
     pub max_docs: usize,
+    /// 送入 rerank 端点的单篇文档字符上限：端点侧静默截断会改变打分，
+    /// 因此在客户端显式截断（按 char 边界，不切断 UTF-8）
+    pub doc_chars: usize,
     pub timeout_seconds: f64,
 }
 
@@ -222,6 +225,7 @@ impl RerankSettings {
             top_n: var_parse("RERANK_TOP_N", 10usize),
             min_score: var_parse("RERANK_MIN_SCORE", 0.05f32),
             max_docs: var_parse("RERANK_MAX_DOCS", 24usize),
+            doc_chars: var_parse("RERANK_DOC_CHARS", 5000usize),
             timeout_seconds: var_parse("RERANK_TIMEOUT_SECONDS", 60.0f64),
         }
     }
@@ -329,6 +333,34 @@ impl RetrievalEnvSettings {
         inner.span_merge_enabled =
             var_bool("RETRIEVAL_SPAN_MERGE_ENABLED", inner.span_merge_enabled);
         inner.rerank_pool_k = var_parse("RETRIEVAL_RERANK_POOL_K", inner.rerank_pool_k);
+        inner.marginal_coverage_enabled = var_bool(
+            "RETRIEVAL_MARGINAL_COVERAGE_ENABLED",
+            inner.marginal_coverage_enabled,
+        );
+        inner.facet_temperature =
+            var_parse("RETRIEVAL_FACET_TEMPERATURE", inner.facet_temperature);
+        inner.reserved_candidate_slots = var_parse(
+            "RETRIEVAL_RESERVED_CANDIDATE_SLOTS",
+            inner.reserved_candidate_slots,
+        );
+        inner.context_bundle_enabled = var_bool(
+            "RETRIEVAL_CONTEXT_BUNDLE_ENABLED",
+            inner.context_bundle_enabled,
+        );
+        inner.bundle_max_chars =
+            var_parse("RETRIEVAL_BUNDLE_MAX_CHARS", inner.bundle_max_chars);
+        inner.graph_expansion_enabled = var_bool(
+            "RETRIEVAL_GRAPH_EXPANSION_ENABLED",
+            inner.graph_expansion_enabled,
+        );
+        inner.graph_weight = var_parse("RETRIEVAL_GRAPH_WEIGHT", inner.graph_weight);
+        inner.graph_max_nodes = var_parse("RETRIEVAL_GRAPH_MAX_NODES", inner.graph_max_nodes);
+        inner.graph_fanout_cap = var_parse("RETRIEVAL_GRAPH_FANOUT_CAP", inner.graph_fanout_cap);
+        inner.span_window_lines = var_parse("RETRIEVAL_SPAN_WINDOW_LINES", inner.span_window_lines);
+        inner.selector_rank_weight = var_parse(
+            "RETRIEVAL_SELECTOR_RANK_WEIGHT",
+            inner.selector_rank_weight,
+        );
         Self {
             inner,
             // 回落链：显式 RETRIEVAL_QUERY_REWRITE_MODEL > LLM_MODEL > 内置默认。

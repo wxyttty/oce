@@ -169,18 +169,30 @@ fn apply_confidence_floor<F: Fn(&str) -> f32>(
 }
 
 /// 多查询 RRF 融合。首个查询权重 1.0，facet 查询用 facet_weight。
+/// RRF 各路权重：首路（原查询）满权，其余给 `facet_weight`；图扩展路在末尾时
+/// 单独用 `graph_weight` 覆盖它——图候选是"推测出来的邻居"，权重必须低于直接召回。
+fn rrf_weights(list_count: usize, facet_weight: f32, graph_weight: Option<f32>) -> Vec<f32> {
+    let mut weights: Vec<f32> = std::iter::once(1.0)
+        .chain(std::iter::repeat(facet_weight).take(list_count.saturating_sub(1)))
+        .collect();
+    if let Some(graph_weight) = graph_weight {
+        if let Some(last) = weights.last_mut() {
+            *last = graph_weight;
+        }
+    }
+    weights
+}
+
 fn fuse(
-    result_lists: Vec<Vec<SearchHit>>,
+    result_lists: &[Vec<SearchHit>],
+    weights: &[f32],
     rrf_k: usize,
-    facet_weight: f32,
     default_top_k: usize,
 ) -> Vec<SearchHit> {
     if result_lists.len() == 1 {
-        return result_lists.into_iter().next().unwrap();
+        return result_lists[0].clone();
     }
-    let weights: Vec<f32> = std::iter::once(1.0)
-        .chain(std::iter::repeat(facet_weight).take(result_lists.len() - 1))
-        .collect();
+    let weights: Vec<f32> = weights.iter().copied().take(result_lists.len()).collect();
     let max_score: f32 = weights.iter().map(|w| w / (rrf_k as f32 + 1.0)).sum();
 
     let mut scores: HashMap<(String, String, u32, u32, String), f32> = HashMap::new();
@@ -188,13 +200,13 @@ fn fuse(
     let mut first_seen: HashMap<(String, String, u32, u32, String), usize> = HashMap::new();
     let mut ordinal = 0usize;
 
-    for (weight, hits) in weights.into_iter().zip(result_lists.into_iter()) {
-        for (rank, hit) in hits.into_iter().enumerate() {
-            let key = search_hit_key(&hit);
+    for (weight, hits) in weights.iter().zip(result_lists.iter()) {
+        for (rank, hit) in hits.iter().enumerate() {
+            let key = search_hit_key(hit);
             if !first_seen.contains_key(&key) {
                 first_seen.insert(key.clone(), ordinal);
                 ordinal += 1;
-                hits_by_key.insert(key.clone(), hit);
+                hits_by_key.insert(key.clone(), hit.clone());
             }
             *scores.entry(key).or_insert(0.0) += weight / (rrf_k as f32 + rank as f32 + 1.0);
         }
@@ -225,6 +237,53 @@ fn merge_exact_hits(
     settings: &RetrievalSettings,
     llm_max_candidates: Option<usize>,
 ) -> Vec<SearchHit> {
+    if settings.reserved_candidate_slots > 0 && !semantic_hits.is_empty() && !exact_hits.is_empty() {
+        // 通用名额保留（RETRIEVAL_RESERVED_CANDIDATE_SLOTS，默认 0=关闭）：
+        // 精确召回独占的候选按固定名额进入候选池，不被语义融合的平截挤掉——
+        // 把 CALL_CHAIN 的手工 1/3 规则推广到所有意图。分数仍不超过语义锚点，
+        // 避免"精确命中"单靠拼接分压过重排结果。
+        let semantic_keys: std::collections::HashSet<_> =
+            semantic_hits.iter().map(search_hit_key).collect();
+        let mut exact_only: Vec<SearchHit> = exact_hits
+            .iter()
+            .filter(|hit| !semantic_keys.contains(&search_hit_key(hit)))
+            .cloned()
+            .collect();
+        if !exact_only.is_empty() {
+            let candidate_window = llm_max_candidates
+                .unwrap_or(settings.default_top_k)
+                .min(settings.default_top_k)
+                .max(1);
+            let reserved = exact_only
+                .len()
+                .min(settings.reserved_candidate_slots)
+                .min(candidate_window);
+            let semantic_slots = candidate_window.saturating_sub(reserved).max(1);
+            let anchor_index = semantic_hits.len().min(semantic_slots) - 1;
+            let anchor_score = semantic_hits[anchor_index].score;
+            exact_only = exact_only
+                .into_iter()
+                .take(reserved)
+                .map(|mut hit| {
+                    hit.score = hit.score.min(anchor_score);
+                    hit
+                })
+                .collect();
+            // 语义候选只取 semantic_slots 条再合并：否则共享的窗口全被语义占满，
+            // "保留名额"名存实亡（CALL_CHAIN 分支靠语义词表通常长于 semantic_slots
+            // 才碰巧成立）。
+            let mut merged: Vec<SearchHit> = semantic_hits.into_iter().take(semantic_slots).collect();
+            merged.extend(exact_only);
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(settings.default_top_k);
+            return merged;
+        }
+    }
+
     if classify_query_intent(query) == Intent::CallChain && !semantic_hits.is_empty() {
         let semantic_keys: std::collections::HashSet<_> =
             semantic_hits.iter().map(search_hit_key).collect();
@@ -401,6 +460,7 @@ impl RetrievalPipeline {
                     settings.max_chunks_per_path,
                     settings.max_context_chars,
                     settings.overlap_threshold,
+                    settings.selector_rank_weight,
                 )
                 .expect("invalid coverage selector settings"),
             ),
@@ -413,6 +473,8 @@ impl RetrievalPipeline {
                         .min(crate::broad::BROAD_MAX_CHUNKS_PER_PATH),
                     settings.max_context_chars,
                     settings.overlap_threshold,
+                    // broad regime 覆盖优先，rank 项无意义
+                    0.0,
                 )
                 .expect("invalid broad coverage selector settings"),
             ),
@@ -604,13 +666,25 @@ impl RetrievalPipeline {
 
         let hits = {
             let _g = audit.as_deref_mut().map(|a| a.stage("fuse"));
+            let graph = self
+                .graph_candidates(query, &all_result_lists, allowed_blob_names)
+                .await;
+            let graph_weight = (!graph.is_empty()).then_some(self.settings.graph_weight);
+            if !graph.is_empty() {
+                all_result_lists.push(graph);
+            }
             let semantic = if all_result_lists.is_empty() {
                 vec![]
             } else {
-                fuse(
-                    all_result_lists,
-                    self.settings.rrf_k,
+                let weights = rrf_weights(
+                    all_result_lists.len(),
                     self.settings.query_facet_weight,
+                    graph_weight,
+                );
+                fuse(
+                    &all_result_lists,
+                    &weights,
+                    self.settings.rrf_k,
                     self.settings.default_top_k,
                 )
             };
@@ -623,15 +697,15 @@ impl RetrievalPipeline {
             )
         };
 
-        // rerank 候选池截断（RETRIEVAL_RERANK_POOL_K，默认 0=不截断）：
-        // 向量召回 default_top_k 与 rerank 池解耦——大池保融合质量，
-        // 小池让 reranker 集中在嵌入头部候选上。
-        let hits = if self.settings.rerank_pool_k > 0 && hits.len() > self.settings.rerank_pool_k {
-            hits.into_iter().take(self.settings.rerank_pool_k).collect()
-        } else {
-            hits
-        };
-
+        // 子窗口切分（RETRIEVAL_SPAN_WINDOW_LINES）：融合/合并/rerank 仍按
+        // chunk 粒度（RRF 名次语义、reranker 看到的文档与关闭时一致——
+        // reranker 的词法偶好需要整段上下文携带，孤立窗口实测会掉分），
+        // 切分发生在 **rerank 之后**：每个子窗口继承所属 chunk 的重排分，
+        // 选择器按「窗口粒度」打包——大 chunk 的答案窗口不再背负整段成本
+        // （实测：171 行答案 chunk 重排分 0.984 但被成本归一挤出窗口，
+        // 同分的 44 行窗口增益是其 1.66 倍）。这是对方「实体打分 + 原子
+        // span 打包」的无重建索引近似。
+        let mut rerank_degraded: Option<String> = None;
         let hits = {
             let _g = audit.as_deref_mut().map(|a| a.stage("rerank"));
             // rerank 冷却期内直接保序回退，不再打外部端点
@@ -661,6 +735,8 @@ impl RetrievalPipeline {
                     }
                     Err(exc) => {
                         self.cooldowns.rerank.trip(COOLDOWN);
+                        // 降级原因在块外写回 audit：块内 _g 持有可变借用
+                        rerank_degraded = Some(exc.code.clone());
                         tracing::warn!(
                             "rerank failed; keep fused order, paused {COOLDOWN:?}: {exc}"
                         );
@@ -668,6 +744,29 @@ impl RetrievalPipeline {
                     }
                 }
             }
+        };
+        if let Some(a) = audit.as_deref_mut() {
+            a.rerank_degraded = rerank_degraded;
+        }
+        // 子窗口切分（RETRIEVAL_SPAN_WINDOW_LINES）：切分发生在 **rerank 之后**。
+        // 融合/重排仍按 chunk 粒度（RRF 名次语义、reranker 看到的文档与关闭时
+        // 一致——reranker 的词法偶好需要整段上下文携带，孤立窗口实测会掉分）；
+        // 每个子窗口继承所属 chunk 的重排分，选择器按「窗口粒度」打包——
+        // 大 chunk 的答案窗口不再背负整段成本（实测：171 行答案 chunk 重排分
+        // 0.984 但被成本归一挤出窗口，同分的 44 行窗口增益是其 1.66 倍）。
+        // 这是对方「实体打分 + 原子 span 打包」的无重建索引近似。
+        let hits = crate::span_window::split_hits_into_windows(
+            hits,
+            self.settings.span_window_lines,
+        );
+        // rerank 候选池截断（RETRIEVAL_RERANK_POOL_K，默认 0=不截断）：
+        // 向量召回 default_top_k 与 rerank 池解耦——大池保融合质量，
+        // 小池让 reranker 集中在嵌入头部候选上。切窗之后截断：窗口继承
+        // chunk 名次，截断语义与关闭时一致。
+        let hits = if self.settings.rerank_pool_k > 0 && hits.len() > self.settings.rerank_pool_k {
+            hits.into_iter().take(self.settings.rerank_pool_k).collect()
+        } else {
+            hits
         };
         // 源码优先 × 元目录降权（RETRIEVAL_META_DIR_PENALTY_ENABLED）。meta 因子
         // 需要查询语境（.github 文件对 CI 意图查询豁免），只在主检索路生效——
@@ -681,21 +780,42 @@ impl RetrievalPipeline {
             .map(|s| s.enable_llm_rerank)
             .unwrap_or_else(|| self.llm_reranker.is_some());
         let hits = if use_llm_rerank {
-            let _g = audit.as_deref_mut().map(|a| a.stage("llm_rerank"));
-            match self.llm_reranker.as_ref() {
-                // LLM 重排失败 → 静默退回原始顺序（与 Python 语义一致，绝不丢召回）
-                // 冷却期内直接跳过，不再等满超时
-                Some(r) if !self.cooldowns.llm.is_down() => {
-                    match r.rerank(query, hits.clone()).await {
-                        Ok(h) => h,
-                        Err(exc) => {
-                            self.cooldowns.llm.trip(COOLDOWN);
-                            tracing::warn!("LLM rerank failed; fallback to original order, paused {COOLDOWN:?}: {exc}");
-                            hits
-                        }
+            // 阶段计时的作用域到此为止：降级事实要写回 audit，而 _g 持有它的可变借用
+            let outcome = {
+                let _g = audit.as_deref_mut().map(|a| a.stage("llm_rerank"));
+                match self.llm_reranker.as_ref() {
+                    // LLM 重排失败 → 静默退回原始顺序（与 Python 语义一致，绝不丢召回）
+                    // 冷却期内直接跳过，不再等满超时
+                    Some(r) if !self.cooldowns.llm.is_down() => {
+                        Some(r.rerank(query, hits.clone()).await)
                     }
+                    _ => None,
                 }
-                _ => hits,
+            };
+            match outcome {
+                Some(Ok(outcome)) => {
+                    if let Some(a) = audit.as_deref_mut() {
+                        a.llm_rerank_degraded = outcome.degraded.clone();
+                        a.llm_rerank_returned = Some(outcome.returned);
+                    }
+                    if let Some(reason) = outcome.degraded.as_deref() {
+                        tracing::debug!(
+                            "llm rerank degraded ({reason}): requested {} returned {}",
+                            outcome.requested,
+                            outcome.returned
+                        );
+                    }
+                    outcome.ranked
+                }
+                Some(Err(exc)) => {
+                    self.cooldowns.llm.trip(COOLDOWN);
+                    if let Some(a) = audit.as_deref_mut() {
+                        a.llm_rerank_degraded = Some(exc.code.clone());
+                    }
+                    tracing::warn!("LLM rerank failed; fallback to original order, paused {COOLDOWN:?}: {exc}");
+                    hits
+                }
+                None => hits,
             }
         } else {
             hits
@@ -722,11 +842,43 @@ impl RetrievalPipeline {
                 } else {
                     select_k
                 };
-                let pooled = if broad {
-                    // broad regime：宽窗口 + per-path 收紧，覆盖优先于深度
-                    self.selector_broad.select(&hits, pool)
+                let facet_scores = if self.settings.marginal_coverage_enabled {
+                    // facet 亲和度对齐窗口粒度：召回列表同样切窗（同一 chunk 的
+                    // 子窗口继承该路召回分数——chunk 被第 j 路召回 ⇒ 其全部
+                    // 子窗口在第 j 列有亲和度），否则窗口 key 对不上 chunk key、
+                    // 亲和度全零，边际覆盖退化成纯分数贪心
+                    let windowed_lists: Vec<Vec<SearchHit>> = all_result_lists
+                        .iter()
+                        .map(|list| {
+                            crate::span_window::split_hits_into_windows(
+                                list.clone(),
+                                self.settings.span_window_lines,
+                            )
+                        })
+                        .collect();
+                    crate::selector::facet_affinity(
+                        &hits,
+                        &windowed_lists,
+                        self.settings.facet_temperature,
+                    )
                 } else {
-                    self.selector.select(&hits, pool)
+                    Vec::new()
+                };
+                // 短函数 bundle（RETRIEVAL_CONTEXT_BUNDLE_ENABLED）：开关关时零查询
+                let bundles = self.context_bundles(&hits).await;
+                let pooled = if self.settings.marginal_coverage_enabled && !facet_scores.is_empty() {
+                    // 边际覆盖贪心（facet 亲和度由各路召回列表构造，不再多打模型）
+                    self.selector.select_with_coverage_and_bundles(
+                        &hits,
+                        &facet_scores,
+                        &bundles,
+                        pool,
+                    )
+                } else if broad {
+                    // broad regime：宽窗口 + per-path 收紧，覆盖优先于深度
+                    self.selector_broad.select_with_bundles(&hits, &bundles, pool)
+                } else {
+                    self.selector.select_with_bundles(&hits, &bundles, pool)
                 };
                 if !merge_enabled {
                     pooled
@@ -848,7 +1000,8 @@ impl RetrievalPipeline {
                 return vec![]; // 嵌入失败不阻断其它子查询
             }
         };
-        self.store
+        let hits = self
+            .store
             .search(
                 query,
                 &query_vector,
@@ -857,7 +1010,8 @@ impl RetrievalPipeline {
                 self.settings.vector_threshold,
             )
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+        hits
     }
 
     /// 精确标识符召回。scope 超限或提取不到标识符时返回空。
@@ -891,6 +1045,122 @@ impl RetrievalPipeline {
             Ok(hits) => hits,
             Err(_) => vec![], // 精确召回失败回退语义候选
         }
+    }
+
+    /// 图扩展候选：从锚点正文现算静态调用关系，把被调符号的**跨文件**定义召回成一路候选。
+    ///
+    /// - 只做 1 跳、只在 `REFERENCE` / `CALL_CHAIN` 意图下启用（其余意图加边是噪声）；
+    /// - hub 抑制：定义文件扇出 > `graph_fanout_cap` 的通用符号不进图；
+    /// - 返回空表示这一路不参与融合（调用方据此不加权）。
+    async fn graph_candidates(
+        &self,
+        query: &str,
+        all_result_lists: &[Vec<SearchHit>],
+        allowed_blob_names: Option<&[String]>,
+    ) -> Vec<SearchHit> {
+        if !self.settings.graph_expansion_enabled {
+            return Vec::new();
+        }
+        if !matches!(
+            classify_query_intent(query),
+            Intent::Reference | Intent::CallChain
+        ) {
+            return Vec::new();
+        }
+        let Some(store) = self.exact_store.as_ref() else {
+            return Vec::new();
+        };
+        // 种子：各路召回的头部锚点。整池跑正则既没必要，也挡不住噪声。
+        let mut identifiers: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for list in all_result_lists {
+            for hit in list
+                .iter()
+                .take(crate::retrieval_settings::GRAPH_SEED_PER_LIST)
+            {
+                for relation in crate::relation::extract_relations(&hit.path, &hit.content) {
+                    if !relation.is_resolved() {
+                        continue;
+                    }
+                    let last = relation
+                        .dst_identifier
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(relation.dst_identifier.as_str());
+                    if last.chars().count() >= 3 && seen.insert(last.to_string()) {
+                        identifiers.push(last.to_string());
+                    }
+                }
+            }
+        }
+        if identifiers.is_empty() {
+            return Vec::new();
+        }
+        // hub 抑制：先看定义的文件扇出，通用符号（String / Result / Config 之类）不进图
+        let definitions = match store.find_definitions(&identifiers, allowed_blob_names).await {
+            Ok(definitions) => definitions,
+            Err(_) => return Vec::new(),
+        };
+        let mut keep: Vec<String> = definitions
+            .iter()
+            .filter(|definition| definition.file_fanout <= self.settings.graph_fanout_cap)
+            .map(|definition| definition.identifier.clone())
+            .collect();
+        keep.sort();
+        keep.dedup();
+        if keep.is_empty() {
+            return Vec::new();
+        }
+        let hits = match store
+            .search_exact(&keep, allowed_blob_names, self.settings.graph_max_nodes)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(_) => Vec::new(),
+        };
+        tracing::debug!(
+            "graph expansion: seeds={} identifiers={} kept={} hits={}",
+            all_result_lists
+                .iter()
+                .map(|list| list.len().min(crate::retrieval_settings::GRAPH_SEED_PER_LIST))
+                .sum::<usize>(),
+            identifiers.len(),
+            keep.len(),
+            hits.len()
+        );
+        hits
+    }
+
+    /// 开关打开时构造短函数 bundle：按 `symbol_occurrences` 的 definition 行给候选
+    /// 标注符号名，同符号的多段命中聚成一个可整体取舍的 bundle。
+    ///
+    /// 关时零查询、零行为变化；注解查询失败只降级为「无 bundle」，不阻断检索。
+    async fn context_bundles(&self, hits: &[SearchHit]) -> Vec<Vec<usize>> {
+        if !self.settings.context_bundle_enabled {
+            return Vec::new();
+        }
+        let Some(store) = self.exact_store.as_ref() else {
+            return Vec::new();
+        };
+        let mut blobs: Vec<String> = hits.iter().map(|hit| hit.blob_name.clone()).collect();
+        blobs.sort();
+        blobs.dedup();
+        let rows = match store.definitions_for_blobs(&blobs).await {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        let annotations = crate::search::annotate_symbols(hits, &rows);
+        let entities = crate::selector::build_entities(hits, &annotations);
+        let bundles = crate::selector::build_bundles(&entities, hits, self.settings.bundle_max_chars);
+        tracing::debug!(
+            "context bundles: hits={} symbol_rows={} annotated={} entities={} bundles={}",
+            hits.len(),
+            rows.len(),
+            annotations.len(),
+            entities.len(),
+            bundles.len()
+        );
+        bundles
     }
 
     /// 路径索引增强的检索（文件名查询）。
@@ -980,9 +1250,10 @@ impl RetrievalPipeline {
 
         // 2. 内容索引检索（常规流程）
         let mut content_hits: Vec<SearchHit> = vec![];
+        // 各路召回保留到 select 之后：边际覆盖选择器要用它构造 facet 亲和度
+        let mut all_result_lists: Vec<Vec<SearchHit>> = Vec::new();
         {
             let _g = audit.as_deref_mut().map(|a| a.stage("dense"));
-            let mut all_result_lists: Vec<Vec<SearchHit>> = Vec::new();
             for search_query in &queries_to_search {
                 let planned = self.query_planner.plan(search_query);
                 let num_queries = planned.len();
@@ -997,10 +1268,22 @@ impl RetrievalPipeline {
                 }
             }
             if !all_result_lists.is_empty() {
-                content_hits = fuse(
-                    all_result_lists,
-                    self.settings.rrf_k,
+                let graph = self
+                    .graph_candidates(query, &all_result_lists, allowed_blob_names)
+                    .await;
+                let graph_weight = (!graph.is_empty()).then_some(self.settings.graph_weight);
+                if !graph.is_empty() {
+                    all_result_lists.push(graph);
+                }
+                let weights = rrf_weights(
+                    all_result_lists.len(),
                     self.settings.query_facet_weight,
+                    graph_weight,
+                );
+                content_hits = fuse(
+                    &all_result_lists,
+                    &weights,
+                    self.settings.rrf_k,
                     self.settings.default_top_k,
                 );
             }
@@ -1018,6 +1301,7 @@ impl RetrievalPipeline {
         };
 
         // 4. 常规后处理。路径类查询使用文档中立的优先级因子。
+        let mut rerank_degraded: Option<String> = None;
         let hits = {
             let _g = audit.as_deref_mut().map(|a| a.stage("rerank"));
             if self.cooldowns.rerank.is_down() {
@@ -1044,6 +1328,8 @@ impl RetrievalPipeline {
                     }
                     Err(exc) => {
                         self.cooldowns.rerank.trip(COOLDOWN);
+                        // 降级原因在块外写回 audit：块内 _g 持有可变借用
+                        rerank_degraded = Some(exc.code.clone());
                         tracing::warn!(
                             "rerank failed; keep fused order, paused {COOLDOWN:?}: {exc}"
                         );
@@ -1052,22 +1338,45 @@ impl RetrievalPipeline {
                 }
             }
         };
+        if let Some(a) = audit.as_deref_mut() {
+            a.rerank_degraded = rerank_degraded;
+        }
         let hits = apply_source_priority(hits, path_query_priority_factor);
 
         let hits = if enable_llm_rerank {
-            let _g = audit.as_deref_mut().map(|a| a.stage("llm_rerank"));
-            match self.llm_reranker.as_ref() {
-                Some(r) if !self.cooldowns.llm.is_down() => {
-                    match r.rerank(query, hits.clone()).await {
-                        Ok(h) => h,
-                        Err(exc) => {
-                            self.cooldowns.llm.trip(COOLDOWN);
-                            tracing::warn!("LLM rerank failed; fallback to original order, paused {COOLDOWN:?}: {exc}");
-                            hits
-                        }
+            let outcome = {
+                let _g = audit.as_deref_mut().map(|a| a.stage("llm_rerank"));
+                match self.llm_reranker.as_ref() {
+                    Some(r) if !self.cooldowns.llm.is_down() => {
+                        Some(r.rerank(query, hits.clone()).await)
                     }
+                    _ => None,
                 }
-                _ => hits,
+            };
+            match outcome {
+                Some(Ok(outcome)) => {
+                    if let Some(a) = audit.as_deref_mut() {
+                        a.llm_rerank_degraded = outcome.degraded.clone();
+                        a.llm_rerank_returned = Some(outcome.returned);
+                    }
+                    if let Some(reason) = outcome.degraded.as_deref() {
+                        tracing::debug!(
+                            "llm rerank degraded ({reason}): requested {} returned {}",
+                            outcome.requested,
+                            outcome.returned
+                        );
+                    }
+                    outcome.ranked
+                }
+                Some(Err(exc)) => {
+                    self.cooldowns.llm.trip(COOLDOWN);
+                    if let Some(a) = audit.as_deref_mut() {
+                        a.llm_rerank_degraded = Some(exc.code.clone());
+                    }
+                    tracing::warn!("LLM rerank failed; fallback to original order, paused {COOLDOWN:?}: {exc}");
+                    hits
+                }
+                None => hits,
             }
         } else {
             hits
@@ -1081,7 +1390,27 @@ impl RetrievalPipeline {
                     self.settings.confidence_floor,
                     path_query_priority_factor,
                 );
-                self.selector.select(&hits, self.settings.final_select_k)
+                let facet_scores = if self.settings.marginal_coverage_enabled {
+                    crate::selector::facet_affinity(
+                        &hits,
+                        &all_result_lists,
+                        self.settings.facet_temperature,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let bundles = self.context_bundles(&hits).await;
+                if self.settings.marginal_coverage_enabled && !facet_scores.is_empty() {
+                    self.selector.select_with_coverage_and_bundles(
+                        &hits,
+                        &facet_scores,
+                        &bundles,
+                        self.settings.final_select_k,
+                    )
+                } else {
+                    self.selector
+                        .select_with_bundles(&hits, &bundles, self.settings.final_select_k)
+                }
             };
             let selected_ref: &[SearchHit] = &selected;
             if self.related_symbols_enabled {
@@ -1174,6 +1503,304 @@ impl RetrievalPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{OceError, OceResult};
+    use crate::search::{LlmRerankOutcome, SearchStore};
+    use crate::retrieval_settings::RetrievalSettings;
+
+    // ── LLM 重排降级的测试脚手架：三个最小假实现，够跑通 search() 主链路 ──
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed_documents(&self, texts: Vec<String>) -> OceResult<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0, 0.0]; texts.len()])
+        }
+        async fn embed_query(&self, _text: &str) -> OceResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    struct FakeStore(Vec<SearchHit>);
+
+    #[async_trait::async_trait]
+    impl SearchStore for FakeStore {
+        async fn search(
+            &self,
+            _query: &str,
+            _query_vector: &[f32],
+            _allowed_blob_names: Option<&[String]>,
+            top_k: usize,
+            _vector_threshold: f32,
+        ) -> OceResult<Vec<SearchHit>> {
+            Ok(self.0.iter().take(top_k).cloned().collect())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeLlmMode {
+        NoValidIndex,
+        Padded,
+        ChatError,
+    }
+
+    struct FakeLlm(FakeLlmMode);
+
+    #[async_trait::async_trait]
+    impl LlmReranker for FakeLlm {
+        fn max_candidates(&self) -> usize {
+            10
+        }
+        async fn rerank(
+            &self,
+            _query: &str,
+            candidates: Vec<SearchHit>,
+        ) -> OceResult<LlmRerankOutcome> {
+            match self.0 {
+                FakeLlmMode::ChatError => Err(OceError::new("llm down", "LlmError")),
+                FakeLlmMode::NoValidIndex => Ok(LlmRerankOutcome {
+                    ranked: candidates,
+                    degraded: crate::search::classify_llm_rerank_degraded(3, 0),
+                    requested: 3,
+                    returned: 0,
+                }),
+                FakeLlmMode::Padded => Ok(LlmRerankOutcome {
+                    ranked: candidates,
+                    degraded: crate::search::classify_llm_rerank_degraded(3, 1),
+                    requested: 3,
+                    returned: 1,
+                }),
+            }
+        }
+    }
+
+    /// 跑一次检索并把 (命中数, audit) 回传；命中非空是三种降级共同的底线
+    /// （降级可以，丢召回不行）。
+    async fn run_with_llm(mode: FakeLlmMode) -> (usize, RetrievalAudit) {
+        let hits: Vec<SearchHit> = (0..5)
+            .map(|i| scored_hit(&format!("src/f{i}.rs"), 1.0 - i as f32 * 0.1))
+            .collect();
+        let blobs: Vec<String> = hits.iter().map(|h| h.blob_name.clone()).collect();
+        let mut pipeline = RetrievalPipeline::new(
+            Arc::new(FakeEmbedder),
+            Arc::new(FakeStore(hits)),
+            RetrievalSettings::default(),
+        );
+        pipeline.llm_reranker = Some(Arc::new(FakeLlm(mode)));
+        let mut audit = RetrievalAudit::default();
+        let out = pipeline
+            .search("where is the thing", Some(&blobs), Some(&mut audit))
+            .await;
+        (out.len(), audit)
+    }
+
+    struct FakeExactStore {
+        hits: Vec<SearchHit>,
+        definitions: Vec<crate::related::SymbolDefinition>,
+        requested: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeExactStore {
+        fn new(hits: Vec<SearchHit>, definitions: Vec<crate::related::SymbolDefinition>) -> Self {
+            Self {
+                hits,
+                definitions,
+                requested: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requested(&self) -> Vec<String> {
+            let mut requested = self.requested.lock().unwrap().clone();
+            requested.sort();
+            requested
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExactSearchStore for FakeExactStore {
+        async fn search_exact(
+            &self,
+            identifiers: &[String],
+            _allowed_blob_names: Option<&[String]>,
+            top_k: usize,
+        ) -> OceResult<Vec<SearchHit>> {
+            self.requested
+                .lock()
+                .unwrap()
+                .extend(identifiers.iter().cloned());
+            Ok(self.hits.iter().take(top_k).cloned().collect())
+        }
+
+        async fn find_definitions(
+            &self,
+            identifiers: &[String],
+            _allowed_blob_names: Option<&[String]>,
+        ) -> OceResult<Vec<crate::related::SymbolDefinition>> {
+            Ok(self
+                .definitions
+                .iter()
+                .filter(|definition| identifiers.contains(&definition.identifier))
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn symbol_definition(identifier: &str, fanout: usize) -> crate::related::SymbolDefinition {
+        crate::related::SymbolDefinition {
+            identifier: identifier.into(),
+            kind: "definition".into(),
+            path: format!("src/{identifier}.rs"),
+            file_fanout: fanout,
+        }
+    }
+
+    async fn run_graph_arm(
+        exact_store: Option<Arc<FakeExactStore>>,
+        graph_enabled: bool,
+        seed_content: &str,
+    ) -> Vec<String> {
+        let seed = SearchHit {
+            blob_name: "b-seed".into(),
+            path: "src/app.py".into(),
+            content: seed_content.into(),
+            score: 1.0,
+            content_hash: "h-seed".into(),
+            start_line: 1,
+            end_line: 10,
+        };
+        let mut settings = RetrievalSettings::default();
+        settings.graph_expansion_enabled = graph_enabled;
+        let mut pipeline = RetrievalPipeline::new(
+            Arc::new(FakeEmbedder),
+            Arc::new(FakeStore(vec![seed])),
+            settings,
+        );
+        pipeline.exact_store = exact_store.map(|store| store as Arc<dyn ExactSearchStore>);
+        let out = pipeline
+            .search("TokenRefresher 的调用链在哪里？", Some(&["b-seed".into()]), None)
+            .await;
+        let mut paths: Vec<String> = out.into_iter().map(|hit| hit.path).collect();
+        paths.sort();
+        paths
+    }
+
+    /// STEP-15：开关关时，即使挂了 exact store 也不得查库，输出与没有该端口时逐条相同。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_disabled_matches_legacy() {
+        let store = Arc::new(FakeExactStore::new(
+            vec![scored_hit("src/helper.rs", 0.9)],
+            vec![symbol_definition("helper", 2)],
+        ));
+        let with_store = run_graph_arm(Some(store.clone()), false, "def run():\n    helper()\n").await;
+        let without_store = run_graph_arm(None, false, "def run():\n    helper()\n").await;
+        assert_eq!(with_store, without_store, "开关关时图这一路不得参与");
+        assert!(
+            store.requested().is_empty(),
+            "开关关时不得发起图查询: {:?}",
+            store.requested()
+        );
+    }
+
+    /// STEP-15：hub 抑制——定义文件扇出超过 cap 的通用符号不进图。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_hub_neighbor_capped() {
+        let store = Arc::new(FakeExactStore::new(
+            vec![scored_hit("src/helper.rs", 0.9)],
+            vec![
+                symbol_definition("String", 50), // hub：扇出远超 cap=15
+                symbol_definition("helper", 2),
+            ],
+        ));
+        let paths = run_graph_arm(
+            Some(store.clone()),
+            true,
+            "def run():\n    String()\n    helper()\n",
+        )
+        .await;
+        assert_eq!(
+            store.requested(),
+            vec!["helper".to_string()],
+            "hub 符号不得进入图召回"
+        );
+        assert!(paths.contains(&"src/helper.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn llm_rerank_degraded_no_valid_index() {
+        assert_eq!(
+            crate::search::classify_llm_rerank_degraded(3, 0).as_deref(),
+            Some("no_valid_index")
+        );
+        let (hits, audit) = run_with_llm(FakeLlmMode::NoValidIndex).await;
+        assert!(hits > 0, "降级不得丢召回");
+        assert_eq!(audit.llm_rerank_degraded.as_deref(), Some("no_valid_index"));
+        assert_eq!(audit.llm_rerank_returned, Some(0));
+    }
+
+    #[tokio::test]
+    async fn llm_rerank_degraded_padded() {
+        assert_eq!(
+            crate::search::classify_llm_rerank_degraded(3, 1).as_deref(),
+            Some("padded")
+        );
+        let (hits, audit) = run_with_llm(FakeLlmMode::Padded).await;
+        assert!(hits > 0, "补齐后仍应有候选");
+        assert_eq!(audit.llm_rerank_degraded.as_deref(), Some("padded"));
+        assert_eq!(audit.llm_rerank_returned, Some(1));
+    }
+
+    #[tokio::test]
+    async fn llm_rerank_degraded_chat_error() {
+        let (hits, audit) = run_with_llm(FakeLlmMode::ChatError).await;
+        assert!(hits > 0, "调用失败必须保序回退、保留召回");
+        assert_eq!(audit.llm_rerank_degraded.as_deref(), Some("LlmError"));
+        assert_eq!(audit.llm_rerank_returned, None);
+    }
+
+    #[test]
+    fn reserved_slots_zero_matches_legacy() {
+        // 开关为 0：逐字等于既有合并（去重取高分 + 排序 + 截断）
+        let mut settings = RetrievalSettings::default();
+        settings.default_top_k = 3;
+        settings.reserved_candidate_slots = 0;
+        let semantic = vec![scored_hit("s1.rs", 0.9), scored_hit("s2.rs", 0.5)];
+        let exact = vec![
+            scored_hit("s1.rs", 0.9), // 与语义重复 → 不新增席位
+            scored_hit("e1.rs", 0.7),
+        ];
+        let merged = merge_exact_hits("普通查询", exact, semantic, &settings, None);
+        let paths: Vec<&str> = merged.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["s1.rs", "e1.rs", "s2.rs"]);
+    }
+
+    #[test]
+    fn reserved_slots_keeps_exact_hits() {
+        // 窗口只有 2 席、语义有 3 条更强命中：不保留时精确独占候选被平截挤掉，
+        // 保留 1 席后它必须留在池子里。
+        let mut settings = RetrievalSettings::default();
+        settings.default_top_k = 2;
+        let semantic = vec![
+            scored_hit("s1.rs", 0.9),
+            scored_hit("s2.rs", 0.8),
+            scored_hit("s3.rs", 0.7),
+        ];
+        let exact = vec![scored_hit("e1.rs", 0.3)];
+
+        settings.reserved_candidate_slots = 0;
+        let legacy = merge_exact_hits("普通查询", exact.clone(), semantic.clone(), &settings, None);
+        assert!(
+            legacy.iter().all(|h| h.path != "e1.rs"),
+            "基线：精确独占候选被挤掉"
+        );
+
+        settings.reserved_candidate_slots = 1;
+        let reserved = merge_exact_hits("普通查询", exact, semantic, &settings, None);
+        assert!(
+            reserved.iter().any(|h| h.path == "e1.rs"),
+            "保留 1 席后精确候选必须留在候选池：{:?}",
+            reserved.iter().map(|h| h.path.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(reserved.len(), 2);
+    }
 
     fn scored_hit(path: &str, score: f32) -> SearchHit {
         SearchHit {

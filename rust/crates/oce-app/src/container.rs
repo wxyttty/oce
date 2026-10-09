@@ -37,6 +37,9 @@ struct ApiRerankAdapter {
     runtime: Arc<CredentialConfiguredReranker>,
     top_n: usize,
     max_doc_chars: usize,
+    /// 单次 rerank 请求文档数硬上限（RERANK_MAX_DOCS）：窗口取 min(top_n, max_docs)，
+    /// 超出部分留在未打分尾部——不拆多批，不超请求额度
+    max_docs: usize,
     /// 规则层文件描述注入 rerank 文档（与 embedding_text 同源，RETRIEVAL_FILE_DESC_ENABLED）
     file_desc_enabled: bool,
 }
@@ -54,8 +57,11 @@ impl Reranker for ApiRerankAdapter {
                 unscored: hits,
             });
         }
-        // 候选窗口与 LLM 重排对齐：rerank 是逐篇精排，窗口过浅会截断融合结果
-        let window = hits.len().min(self.top_n.max(1));
+        // 候选窗口与 LLM 重排对齐：rerank 是逐篇精排，窗口过浅会截断融合结果。
+        // 上限同时受 max_docs 约束：单次 rerank 请求文档数不得超过它
+        // （RERANK_MAX_DOCS，用户付费额度约束，不允许超）——超出部分留在
+        // 未打分尾部，不拆多批请求。
+        let window = hits.len().min(self.top_n.max(1)).min(self.max_docs.max(1));
         let candidates: Vec<SearchHit> = hits.into_iter().take(window).collect();
         let documents: Vec<String> = candidates
             .iter()
@@ -268,10 +274,15 @@ impl LlmReranker for LlmRerankerImpl {
         &self,
         query: &str,
         candidates: Vec<oce_core::search::SearchHit>,
-    ) -> oce_core::error::OceResult<Vec<oce_core::search::SearchHit>> {
+    ) -> oce_core::error::OceResult<oce_core::search::LlmRerankOutcome> {
         use oce_core::search::SearchHit;
         if candidates.is_empty() {
-            return Ok(vec![]);
+            return Ok(oce_core::search::LlmRerankOutcome {
+                ranked: vec![],
+                degraded: None,
+                requested: 0,
+                returned: 0,
+            });
         }
         let top_k = self.output_top_k.min(candidates.len());
         // 与 Python _format_candidate 对齐：正文 strip 后截断、中和闭合标签、
@@ -358,6 +369,11 @@ impl LlmReranker for LlmRerankerImpl {
             }
         }
         order.truncate(top_k);
+        let returned = order.len();
+        // 降级分类：LLM 没给出任何有效编号 / 给出的比要求少（靠原序补齐）。
+        // 两种都不影响可用性，但必须可查——否则"少给了几条"只会体现在
+        // 排序质量波动里，且每次都要靠日志猜。
+        let degraded = oce_core::search::classify_llm_rerank_degraded(top_k, returned);
         let mut ranked: Vec<SearchHit> = order.iter().map(|&i| candidates[i].clone()).collect();
         // LLM 返回不足时按原始顺序补齐；完全无有效输出 → 保持原序
         if ranked.len() < top_k {
@@ -377,7 +393,12 @@ impl LlmReranker for LlmRerankerImpl {
         if ranked.is_empty() {
             ranked = candidates.into_iter().take(top_k).collect();
         }
-        Ok(ranked)
+        Ok(oce_core::search::LlmRerankOutcome {
+            ranked,
+            degraded,
+            requested: top_k,
+            returned,
+        })
     }
 }
 /// 查询改写器。
@@ -622,7 +643,11 @@ impl Container {
         } else {
             "etext=v1"
         };
-        let model_fingerprint = format!("{model_tag} dim={vector_dim} {etext_version}");
+        // 切块器版本进指纹：索引的行号/chunk 边界由切块器决定，切块器一变
+        // 旧索引就必须重建（见 `chunk::CHUNKER_VERSION`）。
+        let chunker_version = oce_core::chunk::chunker_fingerprint();
+        let model_fingerprint =
+            format!("{model_tag} dim={vector_dim} {etext_version} {chunker_version}");
 
         // ── 向量引擎分流：trivium（默认）| pgvector（PG 一体化）──
         // 两者实现同一组端口（SearchStore/VectorIndex/PathSearchStore/VectorEngine），
@@ -676,12 +701,18 @@ impl Container {
             let sidecar_path = format!("{}.model", tdb_settings.path);
             let tdb_path_display = tdb_settings.path.clone();
             let legacy_no_etext = format!("{model_tag} dim={vector_dim}");
+            // chunk=v1 是"尚无切块器变更"的基线：它之前发布的 sidecar 只有
+            // `model dim etext` 三段。此时放行旧格式可以避免一次无意义的重建；
+            // 一旦切块器升到 v2，旧格式（含 chunk=v1）都会 fail-closed。
+            let legacy_pre_chunk =
+                format!("{model_tag} dim={vector_dim} {etext_version}");
             let tdb_exists = std::path::Path::new(&tdb_settings.path).exists();
             if tdb_exists {
                 match std::fs::read_to_string(&sidecar_path) {
                     Ok(recorded) => {
                         let recorded = recorded.trim();
                         let compatible = recorded == model_fingerprint
+                            || (chunker_version == "chunk=v1" && recorded == legacy_pre_chunk)
                             || (etext_version == "etext=v1" && recorded == legacy_no_etext);
                         if !recorded.is_empty() && !compatible {
                             return Err(format!(
@@ -822,9 +853,14 @@ impl Container {
                 ));
                 pipeline.reranker = Arc::new(ApiRerankAdapter {
                     top_n: settings.rerank.top_n,
-                    // 与 LLM 重排 snippet_chars 同量级：候选窗口 50 × 1600 字符在
-                    // llama-server CPU 上单次约 20s；更长正文收益递减且延迟线性上涨
-                    max_doc_chars: 1_600,
+                    // 单次请求文档数硬上限：窗口 = min(top_n, max_docs)，不拆多批
+                    max_docs: settings.rerank.max_docs,
+                    // rerank 文档字符上限：RERANK_DOC_CHARS（默认 5000，与端点侧
+                    // truncate_document 同源）。此前硬编码 1600——cAST 窗口常把
+                    // 答案 span 压在 chunk 3000-5000 字符深处，截断让 reranker
+                    // 根本看不到它要排序的东西（行级覆盖实测：36 个缺失 unit 中
+                    // 21 个答案位于 chunk 1600 字符之后）。
+                    max_doc_chars: settings.rerank.doc_chars,
                     file_desc_enabled: settings.retrieval.file_desc_enabled,
                     runtime: runtime.clone(),
                 });

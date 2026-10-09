@@ -64,7 +64,52 @@ pub struct RetrievalSettings {
     /// 向量召回 default_top_k 与 rerank 候选池解耦——大池保融合质量，
     /// 小池让 reranker 集中在嵌入头部候选上（实测 24 池比 120 池 +2.8 分）。
     pub rerank_pool_k: usize,
+    /// 选择器改用「边际覆盖增益 + 成本归一」贪心
+    /// （`RETRIEVAL_MARGINAL_COVERAGE_ENABLED`，默认关；OCE cascade 的目标函数形状）。
+    /// 关时逐字沿用两趟固定顺序填充。
+    pub marginal_coverage_enabled: bool,
+    /// facet 亲和度 soft-max 温度（`RETRIEVAL_FACET_TEMPERATURE`，默认 0.06）：
+    /// 逐列减自身最大值后按该温度取指数，越小越强调"该列最强"。
+    pub facet_temperature: f32,
+    /// 精确召回独占候选的保留名额（`RETRIEVAL_RESERVED_CANDIDATE_SLOTS`，默认 0=关闭）：
+    /// >0 时把 CALL_CHAIN 的手工 1/3 规则推广到所有意图，精确/图候选不被
+    /// 语义融合的 `default_top_k` 平截挤掉。
+    pub reserved_candidate_slots: usize,
+    /// 符号注解 + 短函数 bundle（`RETRIEVAL_CONTEXT_BUNDLE_ENABLED`，默认关）：
+    /// 打开时按 `symbol_occurrences` 的 definition 行给候选标注符号名，供选择器
+    /// 按符号整体取舍；关时零查询、零行为变化。
+    pub context_bundle_enabled: bool,
+    /// bundle 整组字符上限（`RETRIEVAL_BUNDLE_MAX_CHARS`，默认 768）：同符号成员
+    /// 总字符不超过它时作为一个 action 整体取舍，超过则退化为成员逐个取舍。
+    pub bundle_max_chars: usize,
+    /// 图扩展召回（`RETRIEVAL_GRAPH_EXPANSION_ENABLED`，默认关）：从锚点正文现算
+    /// 静态调用关系，把被调符号的**跨文件**定义作为一路低权重候选送进融合。
+    pub graph_expansion_enabled: bool,
+    /// 图这一路在 RRF 里的权重（`RETRIEVAL_GRAPH_WEIGHT`，默认 0.1）。
+    pub graph_weight: f32,
+    /// 图扩展最多引入多少个邻居（`RETRIEVAL_GRAPH_MAX_NODES`，默认 16）。
+    pub graph_max_nodes: usize,
+    /// hub 抑制：定义文件扇出超过它的通用符号不进图（`RETRIEVAL_GRAPH_FANOUT_CAP`，默认 15）。
+    pub graph_fanout_cap: usize,
+    /// 查询期子窗口切分（`RETRIEVAL_SPAN_WINDOW_LINES`，默认 0=关闭）：
+    /// 召回后把超长 chunk 按空行（语句边界代理）切成 ≤该行数的子窗口，
+    /// 子窗口作为独立候选流经 rerank/融合/选择/渲染。行级覆盖实测：
+    /// cAST chunk 平均 45 行但最大 232 行，答案埋在 chunk 中部时 reranker
+    /// 打分被无关前缀稀释；子窗口把答案推到候选头部，逼近对手
+    /// 「每定义一个 unit」的打分精度而不需要重建索引（向量仍 chunk 级，
+    /// 召回已饱和，粒度只影响打分与打包）。
+    pub span_window_lines: usize,
+    /// 选择器 rank 分离权重（`RETRIEVAL_SELECTOR_RANK_WEIGHT`，默认 0=关）：
+    /// rerank 分数饱和（多个 0.9+ 候选几乎同分）时，用组内 rank 的指数
+    /// 衰减 exp(-rank/8) 打破平局——排名靠前的优先入席。对方 EvidenceEngine
+    /// value() 的同款机制（0.5*relevance + 0.5*exp(-rank/8)），替代逆成本
+    /// 奖励做「性价比」区分。>0 时 gain 混入 rank 项。
+    pub selector_rank_weight: f32,
 }
+
+/// 图扩展的种子取样：每路召回只取头部这么多条做关系抽取。
+/// 种子是"已召回内容"，取头部既够用又避免对整个候选池跑正则。
+pub const GRAPH_SEED_PER_LIST: usize = 5;
 
 impl Default for RetrievalSettings {
     fn default() -> Self {
@@ -97,6 +142,17 @@ impl Default for RetrievalSettings {
             meta_dir_penalty_enabled: false,
             span_merge_enabled: false,
             rerank_pool_k: 0,
+            marginal_coverage_enabled: false,
+            facet_temperature: 0.06,
+            reserved_candidate_slots: 0,
+            context_bundle_enabled: false,
+            bundle_max_chars: 768,
+            graph_expansion_enabled: false,
+            graph_weight: 0.1,
+            graph_max_nodes: 16,
+            graph_fanout_cap: 15,
+            span_window_lines: 0,
+            selector_rank_weight: 0.0,
         }
     }
 }

@@ -371,6 +371,7 @@ impl CredentialConfiguredReranker {
                 top_n,
                 min_score,
                 self.fallback.max_docs,
+                self.fallback.doc_chars,
                 self.fallback.timeout_seconds,
                 self.on_usage.clone(),
                 credential_id,

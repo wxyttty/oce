@@ -106,6 +106,16 @@ MILVUS_DENSE_DIM=1024
 
 # ==================== 检索 ====================
 RETRIEVAL_FINAL_SELECT_K=10
+# ---- 行级覆盖调优（2026-10-09 60 题双口径 A/B 验证，同日单变量）----
+# 边际覆盖贪心（多 facet 共同满足优先于单点高分）
+RETRIEVAL_MARGINAL_COVERAGE_ENABLED=true
+# 选择器 rank 分离：rerank 分数饱和时用组内 rank 指数衰减打破平局
+# （cov@4000 94.07% → 95.14%，+1.07 点；0=关）
+RETRIEVAL_SELECTOR_RANK_WEIGHT=0.5
+# v3 小 chunk 下每文件席位放宽（6 → 10：cov@4000 +5.4 点）
+RETRIEVAL_MAX_CHUNKS_PER_PATH=10
+# 返回字符预算（14000 实测优于 11800/13000：截断损失 < 预算收缩损失）
+RETRIEVAL_MAX_CONTEXT_CHARS=14000
 # 规则层文件描述注入（实验开关，默认关；开启触发索引重建提示）
 # RETRIEVAL_FILE_DESC_ENABLED=false
 # related symbols hints 输出层追加（实验开关，默认关）
@@ -117,8 +127,23 @@ RETRIEVAL_FINAL_SELECT_K=10
 # 元目录降权：.github 等 CI 目录 ×0.5，CI 意图查询豁免（实验开关，默认关）
 # RETRIEVAL_META_DIR_PENALTY_ENABLED=false
 
+# ==================== Rerank（API 重排通道） ====================
+# 端点校准分重排（与 LLM 重排互斥；两者都开时 LLM 优先）
+RERANK_ENABLED=true
+RERANK_ENDPOINT=https://ai.gitee.com/v1/rerank
+RERANK_API_KEY=
+RERANK_MODEL=Qwen3-Reranker-8B
+# rerank 窗口（进入端点打分的候选数上限）
+RERANK_TOP_N=100
+# 单次请求文档数硬上限（窗口 = min(TOP_N, MAX_DOCS)，不拆多批）
+RERANK_MAX_DOCS=24
+# 每篇文档送入端点的字符上限（答案常在 chunk 3000+ 字符深处，1600 会截盲）
+RERANK_DOC_CHARS=5000
+
 # ==================== LLM（可选：重排/改写/意图分类） ====================
-LLM_RERANK_ENABLED=true
+# 与上方 RERANK_ENABLED 互斥：两者都开时 LLM 重排优先（后装配覆盖）。
+# 行级覆盖验证配置为 API rerank 通道，故默认 false
+LLM_RERANK_ENABLED=false
 LLM_BASE_URL=https://api.siliconflow.cn/v1
 LLM_API_KEY=
 LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
@@ -173,9 +198,32 @@ WORKER_MAX_RETRIES=3
 
 # ==================== 检索 ====================
 RETRIEVAL_FINAL_SELECT_K=10
+# ---- 行级覆盖调优（2026-10-09 个人模式 60 题双口径 A/B 验证，同日单变量）----
+# 边际覆盖贪心（多 facet 共同满足优先于单点高分）
+RETRIEVAL_MARGINAL_COVERAGE_ENABLED=true
+# 选择器 rank 分离：rerank 分数饱和时用组内 rank 指数衰减打破平局
+# （cov@4000 94.07% → 95.14%，+1.07 点；0=关）
+RETRIEVAL_SELECTOR_RANK_WEIGHT=0.5
+# v3 小 chunk 下每文件席位放宽（6 → 10：cov@4000 +5.4 点）
+RETRIEVAL_MAX_CHUNKS_PER_PATH=10
+# 返回字符预算（14000 实测优于 11800/13000：截断损失 < 预算收缩损失）
+RETRIEVAL_MAX_CONTEXT_CHARS=14000
+
+# ==================== Rerank（API 重排通道） ====================
+# 端点校准分重排（与 LLM 重排互斥；两者都开时 LLM 优先）
+RERANK_ENABLED=true
+RERANK_ENDPOINT=https://ai.gitee.com/v1/rerank
+RERANK_API_KEY=
+RERANK_MODEL=Qwen3-Reranker-8B
+# rerank 窗口（进入端点打分的候选数上限）
+RERANK_TOP_N=100
+# 单次请求文档数硬上限（窗口 = min(TOP_N, MAX_DOCS)，不拆多批）
+RERANK_MAX_DOCS=24
+# 每篇文档送入端点的字符上限（答案常在 chunk 3000+ 字符深处，1600 会截盲）
+RERANK_DOC_CHARS=5000
 
 # ==================== LLM（可选：重排/改写/意图分类） ====================
-LLM_RERANK_ENABLED=true
+LLM_RERANK_ENABLED=false
 LLM_BASE_URL=https://api.siliconflow.cn/v1
 LLM_API_KEY=
 LLM_MODEL=Qwen/Qwen2.5-7B-Instruct

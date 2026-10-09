@@ -405,6 +405,61 @@ impl OpenAILlmClient {
     }
 }
 
+/// 校验 rerank 端点响应：行数、index 唯一且在 `[0, document_count)`、
+/// 分数有限且落在 `[0, 1]`。
+///
+/// provider 的 index 语义差异是 rerank 集成最经典的静默错误来源：缺行、重复 index、
+/// 越界 index 过去被 `filter_map` 丢掉，表现为"排序看起来没变"。这里改为整体失败——
+/// 调用方有熔断 + 保序回退，宁可不重排，也不把分数贴到错的文档上。
+fn validate_rerank_rows(
+    data: &serde_json::Value,
+    requested_rows: usize,
+    document_count: usize,
+) -> OceResult<Vec<(usize, f32)>> {
+    let rows = data["results"]
+        .as_array()
+        .ok_or_else(|| OceError::new("rerank missing results", "RerankError"))?;
+    if rows.len() != requested_rows {
+        return Err(OceError::new(
+            format!(
+                "rerank returned {} rows, expected {requested_rows}",
+                rows.len()
+            ),
+            "RerankError",
+        ));
+    }
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(rows.len());
+    let mut out: Vec<(usize, f32)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let index = row["index"].as_u64().ok_or_else(|| {
+            OceError::new("rerank row is missing an integer index", "RerankError")
+        })? as usize;
+        if index >= document_count || !seen.insert(index) {
+            return Err(OceError::new(
+                format!(
+                    "rerank index {index} is out of range (documents={document_count}) or duplicated"
+                ),
+                "RerankError",
+            ));
+        }
+        let score = row["relevance_score"].as_f64().ok_or_else(|| {
+            OceError::new(
+                "rerank row is missing a numeric relevance_score",
+                "RerankError",
+            )
+        })?;
+        if !score.is_finite() || !(0.0..=1.0).contains(&score) {
+            return Err(OceError::new(
+                format!("rerank score {score} is not a finite value in [0, 1]"),
+                "RerankError",
+            ));
+        }
+        out.push((index, score as f32));
+    }
+    Ok(out)
+}
+
 /// SiliconFlow/Cohere 风格 rerank 客户端（对应 Python OpenAIReranker）。
 pub struct OpenAIReranker {
     http: Client,
@@ -415,6 +470,8 @@ pub struct OpenAIReranker {
     min_score: f32,
     /// 单次请求文档数上限：超过则分批串行，全局重排后截断
     max_docs: usize,
+    /// 单篇文档送入端点前的字符上限（端点侧静默截断不可控）
+    doc_chars: usize,
     on_usage: Option<UsageCallback>,
     credential_id: i64,
 }
@@ -428,6 +485,7 @@ impl OpenAIReranker {
         top_n: usize,
         min_score: f32,
         max_docs: usize,
+        doc_chars: usize,
         timeout_seconds: f64,
         on_usage: Option<UsageCallback>,
         credential_id: i64,
@@ -443,13 +501,15 @@ impl OpenAIReranker {
             top_n,
             min_score,
             max_docs: max_docs.max(1),
+            doc_chars: doc_chars.max(200),
             on_usage,
             credential_id,
         })
     }
 
-    /// 重排：documents 由 query+content 组成；返回 (hit, score) 按 relevance 降序，
-    /// 低于 min_score 的被过滤。
+    /// 重排：documents 由 query+content 组成；返回 (hit, score) 按 relevance 降序。
+    ///
+    /// 低分不再是删除理由：分数只决定顺序，是否入选由选择器的预算与覆盖增益决定。
     pub async fn rerank(
         &self,
         query: &str,
@@ -459,6 +519,13 @@ impl OpenAIReranker {
         if documents.is_empty() {
             return Ok(vec![]);
         }
+        // 端点对超长文档的截断方式不可控；在客户端按 char 边界截断，使同一文档的
+        // 打分在 oce 与 provider 两侧可复现（不切断 UTF-8，也不悄悄丢掉尾部）。
+        let truncated: Vec<String> = documents
+            .iter()
+            .map(|doc| self.truncate_document(doc))
+            .collect();
+        let documents: &[String] = &truncated;
         let top_n = top_n.unwrap_or(self.top_n);
         // rerank 端点单次文档数上限（rerank_max_docs，默认 24）：
         // 超限时分批串行调用，全局索引重排后统一截断——
@@ -477,6 +544,16 @@ impl OpenAIReranker {
         self.rerank_once(query, documents, Some(top_n)).await
     }
 
+    /// 按 char 边界截断到 `doc_chars`；被截断的文档以省略号结尾，便于人工核查。
+    fn truncate_document(&self, document: &str) -> String {
+        if document.chars().count() <= self.doc_chars {
+            return document.to_string();
+        }
+        let mut out: String = document.chars().take(self.doc_chars).collect();
+        out.push('…');
+        out
+    }
+
     /// 单次 rerank 请求：返回 (局部索引, 分数)，top_n=None 时返回全部。
     async fn rerank_once(
         &self,
@@ -488,6 +565,9 @@ impl OpenAIReranker {
             return Ok(vec![]);
         }
         let top_n = top_n.unwrap_or(documents.len());
+        // 端点最多返回 min(top_n, 文档数) 行；据此校验响应，避免把"少给了几行"
+        // 误判成 provider 违约。
+        let requested_rows = top_n.min(documents.len());
         let resp = self
             .http
             .post(&self.endpoint)
@@ -513,18 +593,15 @@ impl OpenAIReranker {
             .json()
             .await
             .map_err(|e| OceError::new(e.to_string(), "RerankError"))?;
-        let mut results: Vec<(usize, f32)> = data["results"]
-            .as_array()
-            .ok_or_else(|| OceError::new("rerank missing results", "RerankError"))?
-            .iter()
-            .filter_map(|item| {
-                Some((
-                    item["index"].as_u64()? as usize,
-                    item["relevance_score"].as_f64()? as f32,
-                ))
-            })
-            .filter(|(_, score)| *score >= self.min_score)
-            .collect();
+        let mut results = validate_rerank_rows(&data, requested_rows, documents.len())?;
+        // 低于 min_score 的行只记录、不删除：删除会让下游选择器再也看不到这些候选。
+        let below = results.iter().filter(|(_, s)| *s < self.min_score).count();
+        if below > 0 {
+            tracing::debug!(
+                "rerank kept {below} row(s) below min_score={:.3} (低分只影响排序，不删除候选)",
+                self.min_score
+            );
+        }
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_n);
         if let Some(cb) = &self.on_usage {
@@ -628,5 +705,61 @@ mod tests {
         assert_eq!(content, "Hello world", "跨 chunk 的 content 增量拼接");
         assert_eq!(reasoning, "think...", "思考链增量单独累积");
         assert_eq!((usage_prompt, usage_completion), (10, 5), "usage 尾包提取");
+    }
+
+    /// rerank 响应校验：缺行必须整体失败，而不是被 filter_map 静默丢掉。
+    #[test]
+    fn rerank_rejects_missing_rows() {
+        let data = serde_json::json!({"results": [{"index": 0, "relevance_score": 0.9}]});
+        let err = validate_rerank_rows(&data, 2, 2).unwrap_err();
+        assert_eq!(err.code, "RerankError");
+        assert!(err.message.contains("expected 2"), "{}", err.message);
+    }
+
+    #[test]
+    fn rerank_rejects_duplicate_index() {
+        let data = serde_json::json!({"results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 0, "relevance_score": 0.5},
+        ]});
+        let err = validate_rerank_rows(&data, 2, 2).unwrap_err();
+        assert!(err.message.contains("duplicated"), "{}", err.message);
+    }
+
+    #[test]
+    fn rerank_rejects_out_of_range_index() {
+        let data = serde_json::json!({"results": [{"index": 5, "relevance_score": 0.9}]});
+        let err = validate_rerank_rows(&data, 1, 2).unwrap_err();
+        assert!(err.message.contains("out of range"), "{}", err.message);
+    }
+
+    /// JSON 表示不了 NaN/Inf：provider 实际会发字符串 "NaN" 或 null，
+    /// 两者都必须被拒（`is_finite` 分支守住越界数值）。
+    #[test]
+    fn rerank_rejects_nan_score() {
+        for bad in [serde_json::json!("NaN"), serde_json::Value::Null] {
+            let data = serde_json::json!({"results": [{"index": 0, "relevance_score": bad}]});
+            let err = validate_rerank_rows(&data, 1, 1).unwrap_err();
+            assert_eq!(err.code, "RerankError");
+        }
+    }
+
+    #[test]
+    fn rerank_rejects_score_above_one() {
+        let data = serde_json::json!({"results": [{"index": 0, "relevance_score": 1.1}]});
+        let err = validate_rerank_rows(&data, 1, 1).unwrap_err();
+        assert!(err.message.contains("[0, 1]"), "{}", err.message);
+    }
+
+    /// 低分不再是删除理由：校验层原样保留，是否入选交给选择器。
+    #[test]
+    fn rerank_keeps_low_score_candidates() {
+        let data = serde_json::json!({"results": [
+            {"index": 0, "relevance_score": 0.9},
+            {"index": 1, "relevance_score": 0.001},
+        ]});
+        let rows = validate_rerank_rows(&data, 2, 2).expect("valid rerank rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|(_, score)| *score < 0.05));
     }
 }
