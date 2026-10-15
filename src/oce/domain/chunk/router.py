@@ -24,6 +24,12 @@ class LanguageChunkerRouter:
         self.fallback = fallback
 
     def chunk(self, content: str, path: str) -> list[Chunk]:
+        if not content or content.isspace():
+            # 空或纯空白文件（如只含换行的空 __init__.py）无可索引语义；astchunk
+            # 对这类源会算出越界行号（1 行文件返回 2-2），worker 重试到上限置
+            # error，客户端永远等不到 ready。短路返回空块，走索引管线
+            # “无有效内容 → 直接 ready”的路径。
+            return []
         language = detect_language(path)
         chunker = self.language_chunkers.get(language)
         if chunker is None:

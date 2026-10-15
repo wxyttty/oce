@@ -20,17 +20,14 @@ from typing import Callable, Iterator
 from loguru import logger
 
 from oce.domain.services.embedder import Embedder
-from oce.domain.services.llm.intent import IntentClassifier
+from oce.domain.services.intent.resolver import IntentResolver, resolve_rules
+from oce.domain.services.intent.signals import extract_symbols, split_independent_clauses
+from oce.domain.services.intent.taxonomy import QueryIntent
 from oce.domain.services.path_search import PathSearchStore
-from oce.domain.services.query_classifier import (
-    QueryIntent as HeuristicQueryIntent,
-    classify_query_intent,
-    extract_code_identifiers,
-    should_use_path_index,
-)
+from oce.domain.services.query_classifier import should_use_path_index
 from oce.domain.services.query_planner import HeuristicQueryPlanner, QueryPlanner
 from oce.domain.services.reranker import NoopReranker, Reranker
-from oce.domain.services.retrieval_strategy import get_strategy
+from oce.domain.services.retrieval_strategy import RetrievalStrategy, get_strategy
 from oce.domain.services.search import ExactSearchStore, SearchHit, SearchStore, search_hit_key
 from oce.domain.services.selector.coverage_selector import CoverageSelector
 from oce.domain.services.selector.protocols import Selector
@@ -111,7 +108,7 @@ class RetrievalPipeline:
         query_planner: QueryPlanner | None = None,
         priority_factor: Callable[[str], float] | None = None,
         settings: RetrievalSettings | None = None,
-        intent_classifier: IntentClassifier | None = None,  # 意图分类器
+        intent_classifier: IntentResolver | None = None,  # 意图判定器
     ) -> None:
         self.embedder = embedder
         self.store = store
@@ -131,10 +128,15 @@ class RetrievalPipeline:
             ),
             min_facet_chars=self.settings.query_min_facet_chars,
         )
-        self.selector = selector or CoverageSelector(
-            max_per_path=self.settings.max_chunks_per_path,
-            max_chars=self.settings.max_context_chars,
-            overlap_threshold=self.settings.overlap_threshold,
+        self._has_custom_selector = selector is not None
+        self.selector = (
+            selector
+            if selector is not None
+            else CoverageSelector(
+                max_per_path=self.settings.max_chunks_per_path,
+                max_chars=self.settings.max_context_chars,
+                overlap_threshold=self.settings.overlap_threshold,
+            )
         )
 
     async def search(
@@ -166,13 +168,27 @@ class RetrievalPipeline:
         # 意图驱动的策略选择
         strategy = None
         detected_intent = None
+        intent_decision = None
         if self.intent_classifier is not None:
-            with stage("intent"):
-                detected_intent = await self.intent_classifier.classify(query)
+            try:
+                with stage("intent"):
+                    intent_decision = await self.intent_classifier.resolve(query)
+                    detected_intent = intent_decision.intent
+            except Exception as e:
+                # 判定器内部已对 provider 故障做降级，这里只兜住真正的意外
+                # 异常；纯规则判定为本地正则，恒定可用。
+                logger.warning(
+                    f"Intent resolution failed: {e}, falling back to rules-only"
+                )
+                intent_decision = resolve_rules(query)
+                detected_intent = intent_decision.intent
             strategy = get_strategy(detected_intent)
             logger.debug(f"Query intent: {detected_intent.value}, strategy: {strategy}")
         if audit is not None and detected_intent is not None:
             audit.intent = detected_intent.value
+            if intent_decision is not None:
+                audit.intent_source = intent_decision.source
+                audit.intent_decision_reason = intent_decision.reason
 
         # 路径索引增强：根据意图或启发式判断
         use_path_index = (
@@ -195,6 +211,7 @@ class RetrievalPipeline:
                     if strategy is not None
                     else self.llm_reranker is not None
                 ),
+                selector=self._selector_for(strategy),
                 audit=audit,
             )
 
@@ -210,6 +227,28 @@ class RetrievalPipeline:
             # 使用改写的查询替换原查询
             if rewritten_queries:
                 queries_to_search = rewritten_queries
+
+        # 复合查询拆分：M 意图的实质差异。策略表里只有 COMPOUND 的
+        # ``split_clauses`` 为真，这正是 M 区别于 F 的地方。
+        # 未启用意图分类时（strategy is None）退回检测器驱动，保持旧行为，
+        # 否则关掉意图分类会连带丢掉复合召回。
+        use_clause_split = (
+            strategy.split_clauses if strategy is not None else True
+        )
+        compound_parts = (
+            split_independent_clauses(query) if use_clause_split else [query]
+        )
+        if len(compound_parts) >= 2:
+            known = set(queries_to_search)
+            queries_to_search.extend(
+                part for part in compound_parts if part not in known
+            )
+            if audit is not None:
+                audit.compound_parts = compound_parts
+            logger.info(
+                "Compound query split into %d retrieval branches",
+                len(queries_to_search),
+            )
 
         # 对每个查询执行完整检索流程
         all_result_lists = []
@@ -234,7 +273,7 @@ class RetrievalPipeline:
 
         with stage("fuse"):
             hits = self._fuse(all_result_lists) if all_result_lists else []
-            hits = self._merge_exact_hits(query, exact_hits, hits)
+            hits = self._merge_exact_hits(query, exact_hits, hits, intent=detected_intent)
         with stage("rerank"):
             hits = await self.reranker.rerank(query, hits)
         hits = self._apply_source_priority(hits)
@@ -247,12 +286,36 @@ class RetrievalPipeline:
         if use_llm_rerank:
             with stage("llm_rerank"):
                 hits = await self._llm_rerank_hits(query, hits)
-        hits = self._promote_symbol_endpoints(query, hits)
+        hits = self._promote_symbol_endpoints(query, hits, intent=detected_intent)
 
         with stage("select"):
             hits = self._apply_confidence_floor(hits)
-            selected = await self.selector.select(hits, self.settings.final_select_k)
+            selector = self._selector_for(strategy)
+            selected = await selector.select(hits, self.settings.final_select_k)
         return selected
+
+    def _selector_for(self, strategy: RetrievalStrategy | None) -> Selector:
+        """按意图返回选择器；预算与默认一致时复用共享实例。
+
+        显式注入的选择器拥有选择策略；意图预算只调整默认 CoverageSelector。
+        默认选择器在预算不同时才新建，避免每次请求都分配对象。
+
+        ``prefer_breadth`` 是 U（引用点）的实质差异：引用点要跨文件铺开，
+        单文件上限压到 1，防止一个文件吃掉整个预算。
+        """
+        if strategy is None or self._has_custom_selector:
+            return self.selector
+
+        max_per_path = strategy.max_chunks_per_path
+        if strategy.prefer_breadth:
+            max_per_path = 1
+        if max_per_path == self.settings.max_chunks_per_path:
+            return self.selector
+        return CoverageSelector(
+            max_per_path=max_per_path,
+            max_chars=self.settings.max_context_chars,
+            overlap_threshold=self.settings.overlap_threshold,
+        )
 
     async def _llm_rerank_hits(
         self, query: str, hits: list[SearchHit]
@@ -324,7 +387,7 @@ class RetrievalPipeline:
                 scope_limit,
             )
             return []
-        identifiers = extract_code_identifiers(query)
+        identifiers = extract_symbols(query)
         if not identifiers:
             return []
         try:
@@ -344,9 +407,12 @@ class RetrievalPipeline:
         query: str,
         exact_hits: list[SearchHit],
         semantic_hits: list[SearchHit],
+        *,
+        intent: QueryIntent | None = None,
     ) -> list[SearchHit]:
+        effective_intent = intent or resolve_rules(query).intent
         if (
-            classify_query_intent(query) == HeuristicQueryIntent.CALL_CHAIN
+            effective_intent == QueryIntent.CALL_CHAIN
             and semantic_hits
         ):
             semantic_keys = {search_hit_key(hit) for hit in semantic_hits}
@@ -390,9 +456,12 @@ class RetrievalPipeline:
     def _promote_symbol_endpoints(
         query: str,
         hits: list[SearchHit],
+        *,
+        intent: QueryIntent | None = None,
     ) -> list[SearchHit]:
         """符号定位时，框架 endpoint 定义稳定优先于同名内部实现。"""
-        if classify_query_intent(query) != HeuristicQueryIntent.SYMBOL:
+        effective_intent = intent or resolve_rules(query).intent
+        if effective_intent != QueryIntent.SYMBOL:
             return hits
         location_markers = (
             "实现位置",
@@ -409,7 +478,7 @@ class RetrievalPipeline:
         )
         if not any(marker in query.casefold() for marker in location_markers):
             return hits
-        identifiers = extract_code_identifiers(query)
+        identifiers = extract_symbols(query)
         if not identifiers:
             return hits
 
@@ -492,6 +561,7 @@ class RetrievalPipeline:
         *,
         enable_query_rewrite: bool,
         enable_llm_rerank: bool,
+        selector: Selector,
         audit: RetrievalAudit | None = None,
     ) -> list[SearchHit]:
         """
@@ -581,7 +651,7 @@ class RetrievalPipeline:
 
         with stage("select"):
             hits = self._apply_confidence_floor(hits, priority_factor=path_query_priority_factor)
-            selected = await self.selector.select(hits, self.settings.final_select_k)
+            selected = await selector.select(hits, self.settings.final_select_k)
         return selected
 
     async def _merge_path_and_content(
@@ -635,11 +705,11 @@ class RetrievalPipeline:
         # 使用一个虚拟查询来获取这些 blob 的内容
         # 这里我们需要直接访问数据库，因为 SearchStore 不提供按 blob_name 查询的接口
         from oce.infrastructure.persistence.models import BlobChunkModel, BlobModel, ChunkModel
-        from oce.shared.database.session import async_session_factory
+        from oce.shared.database.session import get_session_factory
         from sqlalchemy import select
 
         try:
-            async with async_session_factory() as session:
+            async with get_session_factory()() as session:
                 # 为每个 blob 获取第一个 chunk
                 for blob_name in blob_names:
                     stmt = (

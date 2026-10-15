@@ -33,7 +33,8 @@ def _fake_response(payload: dict, status_code: int = 200):
 
 
 def _make_reranker(*, top_n=10, min_score=0.1, response_payload=None,
-                   raise_exc: Exception | None = None, instruct=None):
+                   raise_exc: Exception | None = None, instruct=None,
+                   char_budget=32000):
     """构造一个 OpenAIReranker，注入 mock httpx client。"""
     fake_client = MagicMock(spec=httpx.AsyncClient)
     if raise_exc:
@@ -42,13 +43,14 @@ def _make_reranker(*, top_n=10, min_score=0.1, response_payload=None,
         fake_client.post = AsyncMock(return_value=_fake_response(response_payload or {}))
 
     reranker = OpenAIReranker(
-        endpoint="https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
+        endpoint="https://rerank.test/v1/reranks",
         api_key="sk-xxx",
         model="qwen3-rerank",
         top_n=top_n,
         min_score=min_score,
         client=fake_client,
         instruct=instruct,
+        char_budget=char_budget,
     )
     return reranker, fake_client
 
@@ -62,6 +64,16 @@ async def test_rerank_empty_hits_returns_empty():
     result = await reranker.rerank("q", [])
     assert result == []
     client.post.assert_not_awaited()  # 空就不发请求
+
+
+@pytest.mark.asyncio
+async def test_rerank_blocks_alibaba_endpoint_before_post():
+    reranker, client = _make_reranker(response_payload={"results": []})
+    reranker._endpoint = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+    hits = [_Hit(content="d1")]
+
+    assert await reranker.rerank("q", hits) == hits
+    client.post.assert_not_awaited()
 
 
 # ── SiliconFlow body shape ──────────────────────────────────────────────
@@ -180,6 +192,47 @@ async def test_rerank_top_n_in_body_caps_at_documents_size():
     await reranker.rerank("q", hits)
     body = client.post.call_args.kwargs["json"]
     assert body["top_n"] == 3, "top_n 应该按 hits 数压低"
+
+
+# ── 字符预算削减（防超后端 context）───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerank_slims_documents_by_char_budget():
+    """超预算时整篇收、截当前篇、丢弃后续；top_n 跟着发送数 clamp。"""
+    reranker, client = _make_reranker(
+        top_n=10,
+        char_budget=100,
+        response_payload={"results": []},
+    )
+    hits = [_Hit(content="x" * 80), _Hit(content="y" * 80), _Hit(content="z" * 80)]
+    await reranker.rerank("q", hits)
+
+    body = client.post.call_args.kwargs["json"]
+    assert body["documents"] == ["x" * 80, "y" * 20]  # 前两篇：整篇 + 截断；第三篇丢弃
+    assert body["top_n"] == 2, "top_n 应 clamp 到发送候选数"
+
+
+@pytest.mark.asyncio
+async def test_rerank_results_index_maps_back_to_original_hits():
+    """截断后远端 index 相对发送列表，必须回带原始下标；引用被丢弃候选的 index 忽略。"""
+    reranker, _ = _make_reranker(
+        top_n=10,
+        char_budget=100,
+        min_score=0.1,
+        response_payload={"results": [
+            {"index": 0, "relevance_score": 0.5},
+            {"index": 1, "relevance_score": 0.9},
+            {"index": 2, "relevance_score": 0.99},  # 引用被丢弃的第 3 篇，应忽略
+        ]},
+    )
+    hits = [_Hit(content="a" * 80), _Hit(content="b" * 80), _Hit(content="c" * 80)]
+    result = await reranker.rerank("q", hits)
+
+    # index 0/1 回带原始 hits[0]/hits[1]，按分数降序 -> b, a；index 2 无效被丢
+    assert [h.content for h in result] == ["b" * 80, "a" * 80]
+    assert result[0].score == pytest.approx(0.9)
+    assert result[1].score == pytest.approx(0.5)
 
 
 # ── 失败降级 ─────────────────────────────────────────────────────────────

@@ -110,8 +110,7 @@ def is_ignored_source_path(path: str) -> bool:
     normalized = path.replace("\\", "/").casefold()
     parts = tuple(part for part in normalized.split("/") if part)
     if any(
-        part in IGNORED_DIRECTORY_NAMES
-        or part.endswith((".egg-info", "-retrieval-eval"))
+        part in IGNORED_DIRECTORY_NAMES or part.endswith(".egg-info")
         for part in parts[:-1]
     ):
         return True

@@ -42,48 +42,6 @@ def _configure_logging(verbose: int, data_dir: Path | None = None) -> None:
         os.environ[DATA_DIR_ENV] = str(data_dir)
 
 
-_PERSONAL_ENV_TEMPLATE = """\
-# OpenContextEngine 个人模式配置
-
-# ==================== 鉴权（已按客户端约定预填，一般无需修改）====================
-# HTTP Bearer 鉴权令牌（客户端用 Authorization: Bearer <token> 访问）。
-# 个人模式默认使用与客户端约定的固定值，本机开箱即用；如需自定义须同步改客户端。
-API_KEY=sk-opencontextengine
-
-# ==================== 必填 ====================
-# 嵌入服务 API 密钥（个人模式唯一必填项；缺失则无法建索引 / 检索）
-EMBED_API_KEY=YOUR_EMBEDDING_API_KEY_HERE
-
-# ==================== 嵌入服务（按需调整）====================
-# OpenAI 兼容端点（默认 SiliconFlow）
-# EMBED_ENDPOINT=https://api.siliconflow.cn/v1/embeddings
-# 嵌入模型（须与 EMBED_DIMENSIONS 维度匹配）
-# EMBED_MODEL=Qwen/Qwen3-Embedding-4B
-# 向量维度（必须与模型输出维度一致）
-# EMBED_DIMENSIONS=1024
-
-# ==================== 可选：LLM 增强 ====================
-# 重排 / 意图分类默认开启；可在 model_credentials 表按 kind 配置，未配置则用下面的 fallback。
-# LLM_API_KEY=your_llm_api_key_here
-# LLM_BASE_URL=https://openrouter.ai/api/v1
-# LLM_MODEL=inclusionai/ling-3.0-flash-fin:free
-
-# ==================== 可选：日志落盘 ====================
-# 日志是否写入文件（默认 false，仅输出到控制台）
-# LOG_FILE_ENABLED=true
-# 日志文件路径（默认 <data-dir>/logs/oce.log）
-# LOG_FILE_PATH=/var/log/oce/oce.log
-# 轮转策略：按天 '1 day' / 按大小 '100 MB'
-# LOG_ROTATION=1 day
-# 保留时长：按时间 '30 days' / 按文件数 '10 files'
-# LOG_RETENTION=30 days
-# JSON 格式（便于日志采集，默认 false）
-# LOG_FORMAT_JSON=false
-# 日志级别（WARNING/INFO/DEBUG，默认 INFO）
-# LOG_LEVEL=INFO
-"""
-
-
 def _local_defaults(data_dir: Path) -> dict[str, str]:
     return {
         "DB_URL": f"sqlite+aiosqlite:///{(data_dir / 'oce.db').as_posix()}",
@@ -116,7 +74,9 @@ def _init(args: argparse.Namespace) -> None:
     target = data_dir / ".env"
     if target.exists() and not args.force:
         sys.exit(f".env already exists: {target} (use --force to overwrite)")
-    target.write_text(_PERSONAL_ENV_TEMPLATE, encoding="utf-8")
+    from oce.shared.config.env_template import render_env_template
+
+    target.write_text(render_env_template("personal"), encoding="utf-8")
     print(f"Created {target}")
     print("Next: set EMBED_API_KEY (API_KEY is pre-filled), then run `oce serve`.")
 
@@ -189,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     version = subparsers.add_parser("version", help="Print the oce version")
     version.set_defaults(handler=_version)
+
+    # bench 子命令树。惰性挂载：oce.bench.profiles 反向 import 本模块的 _load_personal_env，
+    # 顶层 import 会成环；放在 build_parser 内 import 可破环（调用时本模块已完整加载）。
+    from oce.bench.cli import build_bench_parser
+
+    build_bench_parser(subparsers)
 
     return parser
 

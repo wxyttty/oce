@@ -29,6 +29,13 @@ from oce.application.commands.queue_admin import (
     ResetQueueCommand,
     ResetQueueCommandHandler,
 )
+from oce.application.commands.reconfigure import (
+    ReconfigureRetrievalCommand,
+    ReconfigureRetrievalCommandHandler,
+    RetrievalConfigQuery,
+    RetrievalConfigQueryHandler,
+    RetrievalReconfigurator,
+)
 from oce.application.commands.requeue import (
     RequeueStaleCommand,
     RequeueStaleCommandHandler,
@@ -67,7 +74,7 @@ from oce.application.queries.reports import (
     TokensReportQuery,
     TokensReportQueryHandler,
 )
-from oce.application.queries.search import SearchQuery, SearchQueryHandler
+from oce.application.queries.search import SearchQuery
 from oce.application.queries.stats import (
     MonitoringStatsQuery,
     MonitoringStatsQueryHandler,
@@ -82,17 +89,15 @@ from oce.application.queries.status import (
 )
 from oce.application.service import RetrievalApplication
 from oce.application.factories.chunker import build_chunker
+from oce.application.factories.retrieval import RetrievalDeps, build_retrieval_stack
 from oce.application.worker import EmbedWorker
-from oce.domain.services.retrieval import RetrievalPipeline
 from oce.infrastructure.embed.credential_embedder import CredentialConfiguredEmbedder
 from oce.infrastructure.embed.credential_reranker import CredentialConfiguredReranker
-from oce.infrastructure.llm.credential_llm_client import CredentialConfiguredLLMClient
 from oce.infrastructure.milvus3 import Milvus3SearchStore
 from oce.infrastructure.milvus3.path_index import PathIndexClient
 from oce.infrastructure.persistence.credential_admin_store import (
     SqlCredentialAdminStore,
 )
-from oce.infrastructure.persistence.symbol_search_store import SymbolSearchStore
 from oce.infrastructure.persistence.uow import SqlAlchemyUnitOfWork
 from oce.infrastructure.metrics.cleanup import MonitoringCleaner
 from oce.infrastructure.metrics.resource_sampler import (
@@ -104,16 +109,28 @@ from oce.infrastructure.metrics.stats_store import SqlMonitoringStatsReader
 from oce.infrastructure.metrics.report_store import SqlReportsReader
 from oce.infrastructure.queue.redis_queue import RedisQueue
 from oce.shared.config import get_settings
-from oce.shared.database.session import async_session_factory
+from oce.shared.database.session import get_session_factory
 from oce.shared.logging import DATA_DIR_ENV
 from oce.shared.metrics import NoopMetricsSink, TokenUsageRecord
 from oce.shared.reports_read import VectorCollectionStat, VectorStoreStat
 
 
 class _CredentialRuntime:
-    def __init__(self, embedder, reranker, llm_clients=()) -> None:
+    def __init__(self, embedder, reranker, llm_clients=(), *, intent_provider=None) -> None:
         self._embedder = embedder
         self._reranker = reranker
+        self._llm_clients = [client for client in llm_clients if client is not None]
+        self._intent_provider = intent_provider
+
+    def set_intent_provider(self, provider) -> None:
+        self._intent_provider = provider
+
+    def set_llm_clients(self, llm_clients) -> None:
+        """热重载换栈后同步 LLM client 覆盖面（llm_rerank 开关会增减 client）。
+
+        必须在 query_bus 原子重注册之后调用：reload 命令据此刷新当前 in-force 的
+        client 集合，否则会对已退休的旧 client 调 reload、漏掉新建的。
+        """
         self._llm_clients = [client for client in llm_clients if client is not None]
 
     async def reload(self) -> int:
@@ -136,12 +153,20 @@ class _CredentialRuntime:
                 await client.reload()
             except Exception as exc:
                 logger.warning("LLM client reload failed: {}", exc)
+        intent_provider = self._intent_provider
+        if intent_provider is not None:
+            try:
+                await intent_provider.reload()
+            except Exception as exc:
+                logger.warning("intent provider reload failed: {}", type(exc).__name__)
         return pool_size
 
 
 class Container:
     def __init__(self) -> None:
         settings = get_settings()
+        # 首次装配才建 engine/工厂（惰性，见 session.py 模块注释）；装配后复用同一实例。
+        async_session_factory = get_session_factory()
         if settings.embedding.dimensions != settings.milvus.dense_dim:
             raise ValueError("EMBED_DIMENSIONS must equal MILVUS_DENSE_DIM")
 
@@ -162,11 +187,6 @@ class Container:
             on_usage=token_usage_cb,
         )
         self.search_store = Milvus3SearchStore(settings.milvus)
-        self.symbol_search_store = SymbolSearchStore(
-            async_session_factory,
-            max_scope_blobs=settings.retrieval.exact_max_scope_blobs,
-            timeout_seconds=settings.retrieval.exact_timeout_seconds,
-        )
 
         self.reranker = CredentialConfiguredReranker(
             async_session_factory,
@@ -185,74 +205,9 @@ class Container:
                 logger.warning("Failed to initialize path index: {}", e)
                 self.path_index = None
 
-        # LLM 三类（LLM 重排 / 查询改写 / 意图分类）各自按 kind 从 model_credentials 解析
-        # 凭证（env 兜底），不再共用单一 client，可分别配置 key/base_url/model/tpm。
-        # reload 命令会一并刷新它们（credential_runtime 持有列表）。
-        llm_clients: list[CredentialConfiguredLLMClient] = []
-
-        self.llm_reranker = None
-        if settings.llm.rerank_enabled:
-            rerank_llm = CredentialConfiguredLLMClient(
-                "llm_rerank",
-                async_session_factory,
-                settings.llm,
-                fallback_model=settings.llm.model,
-                on_usage=token_usage_cb,
-            )
-            llm_clients.append(rerank_llm)
-            from oce.domain.services.llm.reranker import LLMReranker
-            self.llm_reranker = LLMReranker(
-                client=rerank_llm,
-                model=settings.llm.model,
-                max_candidates=settings.llm.max_candidates,
-                output_top_k=settings.llm.output_top_k,
-                snippet_chars=settings.llm.snippet_chars,
-            )
-            logger.info("LLM reranker enabled (kind=llm_rerank)")
-
-        self.query_rewriter = None
-        if settings.retrieval.query_rewrite_enabled:
-            rewrite_llm = CredentialConfiguredLLMClient(
-                "query_rewrite",
-                async_session_factory,
-                settings.llm,
-                fallback_model=settings.retrieval.query_rewrite_model,
-                on_usage=token_usage_cb,
-            )
-            llm_clients.append(rewrite_llm)
-            from oce.domain.services.llm.rewriter import QueryRewriter
-            self.query_rewriter = QueryRewriter(
-                client=rewrite_llm,
-                model=settings.retrieval.query_rewrite_model,
-                num_rewrites=settings.retrieval.query_rewrite_num,
-            )
-            logger.info("Query rewriter enabled (kind=query_rewrite)")
-
-        self.intent_classifier = None
-        if settings.retrieval.intent_classification_enabled:
-            intent_llm = CredentialConfiguredLLMClient(
-                "intent",
-                async_session_factory,
-                settings.llm,
-                fallback_model=settings.llm.model,
-                on_usage=token_usage_cb,
-            )
-            llm_clients.append(intent_llm)
-            from oce.domain.services.llm.intent import IntentClassifier
-            self.intent_classifier = IntentClassifier(
-                llm_client=intent_llm,
-                model=settings.llm.model,
-            )
-            logger.info("Intent classifier enabled (kind=intent)")
-
-        credential_runtime = _CredentialRuntime(
-            self.embedder, self.reranker, llm_clients
-        )
-
-        self.chunker = build_chunker()
-        self._uow_factory = lambda: SqlAlchemyUnitOfWork(async_session_factory)
-
-        # 监控 sink：启用时异步落库，否则空实现（monitoring 已在前面解析）
+        # 监控 sink 先于检索栈构造：工厂需要它作为 SearchQueryHandler 的审计落点。
+        # 纯构造无副作用（缓冲是 deque，落库 task 在 lifespan 调 start() 才建），
+        # 前移不改变启动语义。
         if monitoring.enabled:
             self.metrics = SqlMetricsSink(
                 async_session_factory,
@@ -261,6 +216,42 @@ class Container:
             )
         else:
             self.metrics = NoopMetricsSink()
+
+        # LLM 三类（LLM 重排 / 查询改写 / 意图分类）各自按 kind 从 model_credentials 解析
+        # 凭证（env 兜底），不再共用单一 client，可分别配置 key/base_url/model/tpm。
+        # reload 命令会一并刷新它们（credential_runtime 持有列表）。
+        # 检索栈（pipeline + handler + symbol store + LLM 三件套）统一由工厂构造，
+        # 使冷启动与热重载（RetrievalReconfigurator）共用同一条构造路径。
+        retrieval_deps = RetrievalDeps(
+            embedder=self.embedder,
+            search_store=self.search_store,
+            base_reranker=self.reranker,
+            path_index=self.path_index,
+            session_factory=async_session_factory,
+            metrics=self.metrics,
+            retrieval_audit_enabled=(
+                monitoring.enabled and monitoring.retrieval_audit_enabled
+            ),
+            store_query_text=monitoring.store_query_text,
+            token_usage_cb=token_usage_cb,
+            llm_settings=settings.llm,
+        )
+        self._retrieval_deps = retrieval_deps
+        stack = build_retrieval_stack(settings, retrieval_deps)
+        self.symbol_search_store = stack.symbol_store
+        # 以下三项仅为兼容既有读取点保留；pipeline 实际持有的是 stack 内部实例。
+        self.llm_reranker = stack.pipeline.llm_reranker
+        self.query_rewriter = stack.pipeline.query_rewriter
+        self.intent_classifier = stack.pipeline.intent_classifier
+        self._retrieval_stack = stack
+
+        credential_runtime = _CredentialRuntime(
+            self.embedder, self.reranker, list(stack.llm_clients),
+            intent_provider=stack.intent_provider,
+        )
+
+        self.chunker = build_chunker(settings.chunking)
+        self._uow_factory = lambda: SqlAlchemyUnitOfWork(async_session_factory)
 
         # 资源采样器：监控开启且 psutil 可用时后台周期采样，否则禁用
         if monitoring.enabled:
@@ -402,27 +393,8 @@ class Container:
         )
 
         query_bus = QueryBus()
-        query_bus.register(
-            SearchQuery,
-            SearchQueryHandler(
-                RetrievalPipeline(
-                    embedder=self.embedder,
-                    store=self.search_store,
-                    reranker=self.reranker,
-                    llm_reranker=self.llm_reranker,
-                    query_rewriter=self.query_rewriter,
-                    path_store=self.path_index,
-                    exact_store=self.symbol_search_store,
-                    intent_classifier=self.intent_classifier,
-                    settings=settings.retrieval,
-                ),
-                metrics=self.metrics,
-                retrieval_audit_enabled=(
-                    monitoring.enabled and monitoring.retrieval_audit_enabled
-                ),
-                store_query_text=monitoring.store_query_text,
-            ),
-        )
+        # handler 由工厂构造（与热重载共用同一路径），此处只负责注册。
+        query_bus.register(SearchQuery, stack.handler)
         query_bus.register(FindMissingQuery, FindMissingQueryHandler(self._uow_factory))
         query_bus.register(BlobStatusQuery, BlobStatusQueryHandler(self._uow_factory))
         query_bus.register(ResolveScopeQuery, ResolveScopeQueryHandler(self._uow_factory))
@@ -490,6 +462,33 @@ class Container:
             QueueStatusQueryHandler(self._uow_factory, self.queue),
         )
 
+        # L0 检索参数热重载器：复用同一份 deps（昂贵对象不重建）+ query_bus（原子重注册
+        # 落点）+ live settings（milvus/rerank 就地写回的目标）。generation 从 0 起。
+        def _on_swap(new_stack) -> None:
+            # 热重载换栈后，让既有读取点继续指向 in-force 实例（与冷启动同源）。
+            self.symbol_search_store = new_stack.symbol_store
+            self.llm_reranker = new_stack.pipeline.llm_reranker
+            self.query_rewriter = new_stack.pipeline.query_rewriter
+            self.intent_classifier = new_stack.pipeline.intent_classifier
+            self._retrieval_stack = new_stack
+
+        self.reconfigurator = RetrievalReconfigurator(
+            settings=settings,
+            deps=retrieval_deps,
+            query_bus=query_bus,
+            credential_runtime=credential_runtime,
+            initial_stack=stack,
+            on_swap=_on_swap,
+        )
+        command_bus.register(
+            ReconfigureRetrievalCommand,
+            ReconfigureRetrievalCommandHandler(self.reconfigurator),
+        )
+        query_bus.register(
+            RetrievalConfigQuery,
+            RetrievalConfigQueryHandler(self.reconfigurator),
+        )
+
         self.command_bus = command_bus
         self.query_bus = query_bus
         self.application = RetrievalApplication(
@@ -528,6 +527,7 @@ class Container:
     async def close(self) -> None:
         if self.worker is not None:
             await self.worker.stop()
+        await self.reconfigurator.aclose()
         if self.resource_sampler is not None:
             await self.resource_sampler.stop()
         if self.monitoring_cleaner is not None:

@@ -26,9 +26,19 @@ htmlcov/
 .env.*
 !.env.example
 
+# oce bench: local secret env (feeds both profile loader and docker-compose ${VAR:?})
+bench/profiles/secrets.env
+
+# oce bench: sweep/run products accumulate locally; only curated golden baselines are tracked
+bench/runs/*
+!bench/runs/golden/
+
 *local_demo
 
 data
+!tests/data/
+tests/data/*
+!tests/data/intent-benchmark.jsonl
 logs
 # Rust build artifacts
 /rust/**/target/

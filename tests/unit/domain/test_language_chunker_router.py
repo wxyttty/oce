@@ -71,6 +71,19 @@ def test_unknown_language_uses_the_fallback():
     assert all(chunk.chunk_type == "recursive" for chunk in chunks)
 
 
+@pytest.mark.parametrize("content", ["", "\n", " \t\n \n"])
+def test_blank_content_short_circuits_before_dispatch(content):
+    # 空或纯空白文件（空 __init__.py）不得进入语言 chunker：astchunk 对这类源
+    # 会返回越界行号，导致 worker 重试到上限置 error、客户端永远等不到 ready。
+    chunker = RecordingChunker(frozenset({"markdown"}))
+    fallback = RecursiveChunker()
+    router = LanguageChunkerRouter(language_chunkers=(chunker,), fallback=fallback)
+
+    assert router.chunk(content, "README.md") == []
+    assert router.chunk(content, "__init__.py") == []
+    assert chunker.calls == []
+
+
 def test_duplicate_language_registration_is_rejected():
     with pytest.raises(ValueError, match="语言重复注册: vue"):
         LanguageChunkerRouter(

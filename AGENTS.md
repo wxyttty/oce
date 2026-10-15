@@ -10,7 +10,7 @@ OpenContextEngine (`oce`) 是 ACE 兼容的代码检索服务：
 - PostgreSQL/SQLite 存储元数据与 `symbol_occurrences` 精确标识符索引
 - Milvus 3.0 仅做 dense 向量检索，BM25/sparse 已移除；路径索引独立维护
 - 检索主链路：dense + exact + path → source priority → LLM rerank → coverage select
-- 模型凭据集中在 `model_credentials` 单表，按 kind（embed/rerank/llm_rerank/query_rewrite/intent）+ status=active + 最小 priority 解析，取不到回落各自环境变量
+- 模型凭据集中在 `model_credentials` 单表，按 kind（embed/rerank/llm_rerank/query_rewrite/intent）+ status=active + 最小 priority 解析；无匹配行时回落对应环境变量（`EMBED_*`/`RERANK_*`/`LLM_*`，`RERANK_API_KEY` 为空再复用 `EMBED_API_KEY`）
 - 运维面 `/admin/*` 用独立 `ADMIN_API_KEY`（空则回落 `API_KEY`）：凭据 CRUD/热重载、队列、GC、指标
 - 监控子系统旁路采集调用/token/资源与检索阶段审计，落 metrics 表
 - FastAPI + DDD/CQRS 分层
@@ -38,12 +38,23 @@ uv run python -c "from oce.main import app; print('OK')"
 ```
 
 ```powershell
-uv run pytest tests/unit/application/test_service.py -q
-uv run pytest tests/unit/infrastructure/test_milvus3.py -q
+uv run pytest -q                                        # 全量测试可直接跑
+uv run pytest tests/unit/application/test_service.py -q # 或按文件缩小范围
 ```
 
-按文件粒度跑，让 Milvus Lite / tree-sitter 运行时在进程间释放；内存受限时勿在单进程里跑整个
-`tests/unit/infrastructure`。
+评测（`oce bench`，详见 `docs/evaluation-guide.md`）：
+
+```powershell
+uv run oce bench list                                              # 列出数据集与 profile
+uv run oce bench serve --profile local --tag dev --port 8987       # 零依赖隔离服务（阻塞）
+uv run oce bench run   --base-url http://127.0.0.1:8987 --repo flask
+uv run oce bench sweep --base-url http://127.0.0.1:8987 --repo flask --matrix bench/profiles/sweep_topk.example.toml
+uv run oce bench compare --runs bench/runs --param retrieval.default_top_k
+```
+
+改检索参数按代价分三层：L0 查询期参数可热改（秒级，`reconfigure`/`sweep`）；L1 切块/向量索引
+参数要 reindex；L2 嵌入模型/维度/后端要完整 reset + 重启。可热改清单见
+`application/commands/reconfigure.py` 的 `HOT_*` 白名单。
 
 Rust 版（`rust/`，详见 `rust/README.md`）：
 
@@ -75,6 +86,12 @@ Rust 服务模式：PostgreSQL 元数据（sqlx，schema 与 alembic head 逐列
 - 不保留未接入 production composition root 的占位实现或阶段性迁移注释。
 - 单文件职责单一；注释解释约束和原因，不复述代码。
 - 保持 ACE API 字段与错误语义兼容。
+- 评测（`oce.bench`）专属约束：
+  - profile TOML（`bench/profiles/*.toml`）密钥字段只允许 `<field>_env = "VAR_NAME"` 引用，写成字面量由 `load_profile` 拒绝；密钥取值优先级 真实 env > `bench/profiles/secrets.env`（gitignore）> `model_credentials` 表。
+  - L0 热改端点仅在启动设 `OCE_BENCH_HOT_CONFIG=allow`（由 `oce bench serve` 注入）时放行，否则 409；正常 `oce serve` 永不可被热改检索行为。热改用「重建 + 原子重注册」，禁原地 `setattr`（绕过 pydantic 校验、留撕裂态）。
+  - `oce bench reset` 硬闸：拒绝 DB URL 不含 `oce_bench` 的目标，且永不 drop PROTECTED collection（见 `bench/service.py`）。
+  - 数据集源在仓库根 `bench/datasets/`（hatchling force-include 进 wheel；运行期 `default_datasets_dir()` 按 包内→仓库根 顺序解析）；sweep 产物落 `bench/runs/`（gitignore），仅 curated `bench/runs/golden/` 入版本控制。
+  - md 报告由 `report.py` 的单一渲染体从 RunRecord 渲染，与 JSON 同源——勿另起一套渲染逻辑使二者漂移。
 
 ## 运行环境
 
