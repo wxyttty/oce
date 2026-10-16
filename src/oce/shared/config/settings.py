@@ -186,7 +186,7 @@ class LLMSettings(BaseSettings):
     # 默认不限流（0）：配额因供应商/套餐而异，拍任何具体数字都可能对大配额账号造成
     # 数量级排队（实测 5M 配额账号被 60k 默认卡慢 25 倍）。小配额部署显式设成配额的 80%。
     tpm_limit: int = Field(
-        default=0, ge=0, description="LLM 接口 TPM 上限，>0 时客户端排队，0 不限流"
+        default=60_000, ge=0, description="LLM 接口 TPM 上限，>0 时客户端排队，0 不限流"
     )
 
 
@@ -241,7 +241,7 @@ class RetrievalSettings(BaseSettings):
     )
 
     # 向量检索
-    default_top_k: int = Field(default=30, ge=1, le=200, description="向量召回条数")
+    default_top_k: int = Field(default=50, ge=1, le=200, description="向量召回条数")
     vector_threshold: float = Field(
         default=0.0,
         ge=0.0,
